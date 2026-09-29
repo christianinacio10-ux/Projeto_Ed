@@ -8,7 +8,9 @@
  * 4. Executar como: Eu. Quem tem acesso: qualquer pessoa com uma conta Google
  *    (ou só o domínio, se a companhia usar Google Workspace).
  * 5. Autorize a planilha. A primeira abertura cria "Estoque de Campo" no Drive
- *    dessa conta. O link "Abrir planilha" no rodapé leva até ela.
+ *    dessa conta. O primeiro acesso na tela grava o gestor (e-mail e senha).
+ *    A senha fica só como hash na aba Usuarios. O link "Abrir planilha" no
+ *    rodapé da gestão leva até ela.
  *
  * A tela (HTML + JavaScript) está embutida em paginaHtml_().
  * Não há logo. Depósitos do CSV de origem entram com nome de local, sem marca.
@@ -16,7 +18,7 @@
 
 var APP = {
   nome: 'Estoque de Campo',
-  versao: '1.0.0'
+  versao: '1.1.0'
 };
 
 var SEMENTE_LOCAIS = [
@@ -50,6 +52,32 @@ var CAMPOS_SALDOS = [
   ['localId', 'Local'],
   ['qtd', 'Quantidade']
 ];
+
+var CAMPOS_USUARIOS = [
+  ['id', 'ID'],
+  ['nome', 'Nome'],
+  ['email', 'E-mail'],
+  ['senhaHash', 'Hash da senha'],
+  ['sal', 'Sal'],
+  ['perfil', 'Perfil'],
+  ['ativo', 'Ativo'],
+  ['criadoEm', 'Criado em']
+];
+
+var CAMPOS_SESSOES = [
+  ['token', 'Token'],
+  ['usuarioId', 'Usuario'],
+  ['expiraEm', 'Expira em']
+];
+
+var SESSAO_MS = 12 * 60 * 60 * 1000;
+
+var TIPOS_TECNICO = {
+  SAIDA: 1,
+  DEVOLUCAO: 1,
+  CONSUMO: 1,
+  TRANSFERENCIA: 1
+};
 
 var CAMPOS_MOV = [
   ['id', 'ID'],
@@ -951,51 +979,425 @@ function baseInicial_() {
 }
 
 
+/* ===================================================================== acesso */
+
+function bytesParaHex_(bytes) {
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var b = bytes[i];
+    if (b < 0) b += 256;
+    var h = b.toString(16);
+    hex += h.length === 1 ? '0' + h : h;
+  }
+  return hex;
+}
+
+function hashSenha_(senha, sal) {
+  var texto = String(sal || '') + '\n' + String(senha || '');
+  if (typeof Utilities !== 'undefined' && Utilities.computeDigest && Utilities.DigestAlgorithm) {
+    var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, texto, Utilities.Charset.UTF_8);
+    return bytesParaHex_(digest);
+  }
+  return require('crypto').createHash('sha256').update(texto, 'utf8').digest('hex');
+}
+
+function novoSal_() {
+  if (typeof Utilities !== 'undefined' && Utilities.getUuid) {
+    return String(Utilities.getUuid()).replace(/-/g, '') + String(Utilities.getUuid()).replace(/-/g, '');
+  }
+  return require('crypto').randomBytes(24).toString('hex');
+}
+
+function novoToken_() {
+  return novoSal_();
+}
+
+function emailOk_(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
+}
+
+function senhaOk_(senha) {
+  return String(senha || '').length >= 6;
+}
+
+function normalizarEmail_(email) {
+  return String(email || '').trim().toLowerCase();
+}
+
+function copiarUsuario_(u) {
+  var perfil = String(u.perfil || '').toUpperCase() === 'TECNICO' ? 'TECNICO' : 'GESTOR';
+  return {
+    id: String(u.id || '').trim(),
+    nome: String(u.nome || '').trim().slice(0, 80),
+    email: normalizarEmail_(u.email),
+    senhaHash: String(u.senhaHash || ''),
+    sal: String(u.sal || ''),
+    perfil: perfil,
+    ativo: flagAtivo_(u.ativo === undefined ? '1' : u.ativo),
+    criadoEm: String(u.criadoEm || '')
+  };
+}
+
+function publicoUsuario_(u) {
+  return {
+    id: u.id,
+    nome: u.nome,
+    email: u.email,
+    perfil: u.perfil,
+    iniciais: iniciais_(u.nome),
+    ativo: u.ativo
+  };
+}
+
+function acharUsuarioEmail_(usuarios, email) {
+  var alvo = normalizarEmail_(email);
+  var lista = usuarios || [];
+  for (var i = 0; i < lista.length; i++) {
+    if (lista[i].email === alvo) return lista[i];
+  }
+  return null;
+}
+
+function acharUsuarioId_(usuarios, id) {
+  var alvo = String(id || '');
+  var lista = usuarios || [];
+  for (var i = 0; i < lista.length; i++) {
+    if (lista[i].id === alvo) return lista[i];
+  }
+  return null;
+}
+
+function criarUsuarioNaBase_(base, dados, quando) {
+  var usuarios = (base.usuarios || []).map(copiarUsuario_);
+  dados = dados || {};
+  var nome = String(dados.nome || '').trim().slice(0, 80);
+  var email = normalizarEmail_(dados.email);
+  var senha = String(dados.senha || '');
+  var perfil = String(dados.perfil || 'TECNICO').toUpperCase() === 'GESTOR' ? 'GESTOR' : 'TECNICO';
+  if (nome.length < 2) throw new Error('Informe o nome.');
+  if (!emailOk_(email)) throw new Error('Informe um e-mail válido.');
+  if (!senhaOk_(senha)) throw new Error('A senha precisa de pelo menos 6 caracteres.');
+  if (acharUsuarioEmail_(usuarios, email)) throw new Error('Já existe um acesso com este e-mail.');
+  var sal = novoSal_();
+  var idBase = 'usr-' + slug_(email.split('@')[0]).slice(0, 24);
+  var id = idBase;
+  var n = 2;
+  while (acharUsuarioId_(usuarios, id)) {
+    id = idBase + '-' + n;
+    n++;
+  }
+  var usuario = {
+    id: id,
+    nome: nome,
+    email: email,
+    senhaHash: hashSenha_(senha, sal),
+    sal: sal,
+    perfil: perfil,
+    ativo: '1',
+    criadoEm: String(quando || '')
+  };
+  usuarios.push(usuario);
+  base.usuarios = usuarios;
+  return { base: base, usuario: usuario };
+}
+
+function autenticar_(base, email, senha) {
+  var usuario = acharUsuarioEmail_(base.usuarios || [], email);
+  if (!usuario || usuario.ativo !== '1') throw new Error('E-mail ou senha incorretos.');
+  if (hashSenha_(senha, usuario.sal) !== usuario.senhaHash) throw new Error('E-mail ou senha incorretos.');
+  return usuario;
+}
+
+function abrirSessao_(base, usuario, agoraMs) {
+  var agora = Number(agoraMs) || Date.now();
+  var sessoes = (base.sessoes || []).filter(function (s) {
+    return s && s.token && Number(s.expiraEm) > agora;
+  });
+  var token = novoToken_();
+  sessoes.push({ token: token, usuarioId: usuario.id, expiraEm: agora + SESSAO_MS });
+  base.sessoes = sessoes;
+  return { base: base, token: token };
+}
+
+function resolverSessao_(base, token, agoraMs) {
+  var agora = Number(agoraMs) || Date.now();
+  var tok = String(token || '');
+  if (!tok) throw new Error('Entre com e-mail e senha.');
+  var sessao = null;
+  (base.sessoes || []).forEach(function (s) {
+    if (s && s.token === tok && Number(s.expiraEm) > agora) sessao = s;
+  });
+  if (!sessao) throw new Error('Sessão expirada. Entre de novo.');
+  var usuario = acharUsuarioId_(base.usuarios || [], sessao.usuarioId);
+  if (!usuario || usuario.ativo !== '1') throw new Error('Sessão expirada. Entre de novo.');
+  return usuario;
+}
+
+function exigirGestor_(usuario) {
+  if (!usuario || usuario.perfil !== 'GESTOR') throw new Error('Esta ação é só da gestão.');
+  return usuario;
+}
+
+function gestoresAtivos_(usuarios) {
+  return (usuarios || []).filter(function (u) { return u.perfil === 'GESTOR' && u.ativo === '1'; });
+}
+
+function rotuloDia_(ms) {
+  var d = new Date(ms);
+  var dd = d.getDate();
+  var mm = d.getMonth() + 1;
+  return (dd < 10 ? '0' : '') + dd + '/' + (mm < 10 ? '0' : '') + mm;
+}
+
+function montarRelatorio_(base, movimentos, agoraMs) {
+  var painel = montarPainel_(base, movimentos, agoraMs);
+  var agora = Number(agoraMs) || Date.now();
+  var dia = 24 * 60 * 60 * 1000;
+  var limite30 = agora - (30 * dia);
+  var limite45 = agora - (45 * dia);
+  var inicio8 = agora - (8 * 7 * dia);
+  var uso30 = 0;
+  var perda30 = 0;
+  var ajusteLiq = 0;
+  var saida30 = 0;
+  var semanas = [];
+  var w;
+  for (w = 0; w < 8; w++) {
+    semanas.push({
+      entrada: 0,
+      saida: 0,
+      consumo: 0,
+      baixa: 0,
+      inicio: inicio8 + (w * 7 * dia),
+      rotulo: rotuloDia_(inicio8 + (w * 7 * dia))
+    });
+  }
+  var ultimaSaida = {};
+  (movimentos || []).forEach(function (m) {
+    if (!m || m.tipo === 'SALDO_INICIAL') return;
+    var ms = parseQuando_(m.quando);
+    var valor = Math.abs(Number(m.valor) || 0);
+    if ((m.tipo === 'SAIDA' || m.tipo === 'CONSUMO' || m.tipo === 'BAIXA') && ms) {
+      if (!ultimaSaida[m.sku] || ms > ultimaSaida[m.sku]) ultimaSaida[m.sku] = ms;
+    }
+    if (ms >= limite30) {
+      if (m.tipo === 'CONSUMO') uso30 += valor;
+      if (m.tipo === 'BAIXA') {
+        uso30 += valor;
+        perda30 += valor;
+      }
+      if (m.tipo === 'AJUSTE') ajusteLiq += (m.direcao === 'SAI' ? -valor : valor);
+      if (m.tipo === 'SAIDA') saida30 += valor;
+    }
+    if (ms >= inicio8 && ms <= agora + 1000) {
+      var idx = Math.floor((ms - inicio8) / (7 * dia));
+      if (idx < 0) idx = 0;
+      if (idx > 7) idx = 7;
+      if (m.tipo === 'ENTRADA') semanas[idx].entrada += valor;
+      else if (m.tipo === 'SAIDA') semanas[idx].saida += valor;
+      else if (m.tipo === 'CONSUMO') semanas[idx].consumo += valor;
+      else if (m.tipo === 'BAIXA') semanas[idx].baixa += valor;
+    }
+  });
+  semanas.forEach(function (s) {
+    s.entrada = arredDinheiro_(s.entrada);
+    s.saida = arredDinheiro_(s.saida);
+    s.consumo = arredDinheiro_(s.consumo);
+    s.baixa = arredDinheiro_(s.baixa);
+  });
+
+  var pos = montarPosicao_(base);
+  var ativos = pos.linhas.filter(function (l) { return l.ativo === '1'; });
+  var comPonto = ativos.filter(function (l) { return l.minimo > 0; });
+  var okPonto = comPonto.filter(function (l) { return l.status === 'ok'; });
+  var nivelServico = comPonto.length ? Math.round((okPonto.length / comPonto.length) * 1000) / 10 : null;
+  var valorTotal = painel.kpis.valorTotal;
+  var giro = valorTotal > 0 && uso30 > 0 ? Math.round((uso30 / valorTotal) * 1000) / 10 : null;
+  var coberturaDias = uso30 > 0 ? Math.round((valorTotal * 30 / uso30) * 10) / 10 : null;
+
+  var ordenados = ativos.slice().sort(function (a, b) { return (b.valor || 0) - (a.valor || 0); });
+  var soma = 0;
+  ordenados.forEach(function (l) { soma += Number(l.valor) || 0; });
+  var acum = 0;
+  var pareto = ordenados.slice(0, 8).map(function (l) {
+    acum += Number(l.valor) || 0;
+    return {
+      sku: l.sku,
+      produto: l.produto,
+      valor: arredDinheiro_(l.valor),
+      pct: soma > 0 ? Math.round((l.valor / soma) * 1000) / 10 : 0,
+      acum: soma > 0 ? Math.round((acum / soma) * 1000) / 10 : 0,
+      classeAbc: l.classeAbc
+    };
+  });
+
+  var duravel = 0;
+  var consumivel = 0;
+  ativos.forEach(function (l) {
+    if (l.categoria === 'Consumível') consumivel += Number(l.valor) || 0;
+    else duravel += Number(l.valor) || 0;
+  });
+
+  var lentos = ativos.filter(function (l) {
+    if (!(l.qtdTotal > 0)) return false;
+    var ult = ultimaSaida[l.sku] || 0;
+    return ult < limite45;
+  }).sort(function (a, b) { return (b.valor || 0) - (a.valor || 0); }).slice(0, 8).map(function (l) {
+    return {
+      sku: l.sku,
+      produto: l.produto,
+      valor: arredDinheiro_(l.valor),
+      qtd: l.qtdTotal,
+      unidade: l.unidade,
+      classeAbc: l.classeAbc
+    };
+  });
+
+  return {
+    kpis: painel.kpis,
+    alertas: painel.alertas,
+    abc: painel.abc,
+    depositos: painel.depositos,
+    tecnicos: painel.tecnicos,
+    recentes: painel.recentes,
+    gestao: {
+      nivelServico: nivelServico,
+      comPonto: comPonto.length,
+      okPonto: okPonto.length,
+      giro: giro,
+      coberturaDias: coberturaDias,
+      uso30: arredDinheiro_(uso30),
+      perda30: arredDinheiro_(perda30),
+      ajusteLiquido30: arredDinheiro_(ajusteLiq),
+      saidaCampo30: arredDinheiro_(saida30),
+      pareto: pareto,
+      semanas: semanas,
+      duravel: arredDinheiro_(duravel),
+      consumivel: arredDinheiro_(consumivel),
+      lentos: lentos,
+      temUso: uso30 > 0
+    }
+  };
+}
+
+
 /* ===================================================================== serviço */
 
 function criarServico_(io) {
   function ler() {
-    var base = io.ler();
+    var base = io.ler() || {};
     base.itens = base.itens || [];
     base.locais = base.locais || [];
     base.saldos = base.saldos || [];
     base.movimentos = base.movimentos || [];
     base.seq = Number(base.seq) || 0;
+    base.usuarios = (base.usuarios || []).map(copiarUsuario_).filter(function (u) { return u.id && u.email; });
+    base.sessoes = (base.sessoes || []).map(function (s) {
+      return {
+        token: String(s.token || ''),
+        usuarioId: String(s.usuarioId || ''),
+        expiraEm: Number(s.expiraEm) || 0
+      };
+    }).filter(function (s) { return s.token && s.usuarioId; });
     return base;
   }
 
   function gravar(base, novos) {
+    var atual = ler();
+    if (base.usuarios === undefined) base.usuarios = atual.usuarios;
+    if (base.sessoes === undefined) base.sessoes = atual.sessoes;
     io.gravar(base, novos || []);
   }
 
+  function sessao(token) {
+    return resolverSessao_(ler(), token, io.agoraMs());
+  }
+
+  function gestor(token) {
+    return exigirGestor_(sessao(token));
+  }
+
+  function pacote(usuario) {
+    var base = ler();
+    var painel = montarPainel_(base, base.movimentos, io.agoraMs());
+    return {
+      app: { nome: APP.nome, versao: APP.versao },
+      usuario: publicoUsuario_(usuario),
+      planilhaUrl: usuario.perfil === 'GESTOR' ? (io.url() || '') : '',
+      abaixo: painel.kpis.abaixo
+    };
+  }
+
   return {
-    apiContexto: function () {
-      ler();
-      var usuario = io.contextoUsuario();
-      return {
-        app: { nome: APP.nome, versao: APP.versao },
-        usuario: usuario,
-        planilhaUrl: io.url() || '',
-        abaixo: montarPainel_(ler(), ler().movimentos, io.agoraMs()).kpis.abaixo
-      };
+    apiEstadoAcesso: function () {
+      var base = ler();
+      return { precisaPrimeiroAcesso: !(base.usuarios && base.usuarios.length) };
     },
-    apiPainel: function () {
+    apiPrimeiroAcesso: function (dados) {
+      var base = ler();
+      if (base.usuarios.length) throw new Error('O primeiro acesso já foi feito. Entre com e-mail e senha.');
+      dados = dados || {};
+      var criado = criarUsuarioNaBase_(base, {
+        nome: dados.nome,
+        email: dados.email,
+        senha: dados.senha,
+        perfil: 'GESTOR'
+      }, io.agora());
+      var sess = abrirSessao_(criado.base, criado.usuario, io.agoraMs());
+      gravar(sess.base, []);
+      return { token: sess.token, usuario: publicoUsuario_(criado.usuario) };
+    },
+    apiLogin: function (email, senha) {
+      if (email && typeof email === 'object') {
+        senha = email.senha;
+        email = email.email;
+      }
+      var base = ler();
+      var usuario = autenticar_(base, email, senha);
+      var sess = abrirSessao_(base, usuario, io.agoraMs());
+      gravar(sess.base, []);
+      return { token: sess.token, usuario: publicoUsuario_(usuario) };
+    },
+    apiSair: function (token) {
+      var base = ler();
+      var tok = String(token || '');
+      base.sessoes = (base.sessoes || []).filter(function (s) { return s.token !== tok; });
+      gravar(base, []);
+      return { ok: true };
+    },
+    apiContexto: function (token) {
+      return pacote(sessao(token));
+    },
+    apiPainel: function (token) {
+      sessao(token);
       var base = ler();
       return montarPainel_(base, base.movimentos, io.agoraMs());
     },
-    apiEstoque: function () {
+    apiRelatorio: function (token) {
+      gestor(token);
+      var base = ler();
+      return montarRelatorio_(base, base.movimentos, io.agoraMs());
+    },
+    apiEstoque: function (token) {
+      sessao(token);
       return montarPosicao_(ler());
     },
-    apiHistorico: function () {
+    apiHistorico: function (token) {
+      sessao(token);
       var base = ler();
       var lista = base.movimentos.slice(-400).reverse().map(function (m) {
         return enriquecerMov_(m, base);
       });
       return { movimentos: lista, recorte: base.movimentos.length > 400 };
     },
-    apiMovimentar: function (pedido) {
+    apiMovimentar: function (token, pedido) {
+      var usuario = sessao(token);
+      var tipo = String((pedido && pedido.tipo) || '').toUpperCase();
+      if (usuario.perfil !== 'GESTOR' && !TIPOS_TECNICO[tipo]) {
+        throw new Error('Esta ação é só da gestão.');
+      }
       var base = ler();
-      var r = aplicarMovimento_(base, pedido || {}, io.usuario(), io.agora());
+      var r = aplicarMovimento_(base, pedido || {}, usuario.email, io.agora());
       if (!r.movimento) return { mensagem: 'Nada a lançar.', movimento: null };
       gravar(r.base, [r.movimento]);
       return {
@@ -1003,24 +1405,28 @@ function criarServico_(io) {
         movimento: enriquecerMov_(r.movimento, r.base)
       };
     },
-    apiSalvarItem: function (item) {
+    apiSalvarItem: function (token, item) {
+      var usuario = gestor(token);
       var base = ler();
       var salvo = salvarItemNaBase_(base, item || {});
       gravar(salvo.base, []);
-      return { item: salvo.item, criado: salvo.criado };
+      return { item: salvo.item, criado: salvo.criado, usuario: usuario.email };
     },
-    apiSalvarLocal: function (local) {
+    apiSalvarLocal: function (token, local) {
+      gestor(token);
       var base = ler();
       var salvo = salvarLocalNaBase_(base, local || {});
       gravar(salvo.base, []);
       return { local: salvo.local };
     },
-    apiInativarLocal: function (id) {
+    apiInativarLocal: function (token, id) {
+      gestor(token);
       var base = ler();
       gravar(inativarLocal_(base, id), []);
       return { ok: true };
     },
-    apiReativarLocal: function (id) {
+    apiReativarLocal: function (token, id) {
+      gestor(token);
       var base = ler();
       var locais = (base.locais || []).map(copiarLocal_);
       var achou = false;
@@ -1031,26 +1437,73 @@ function criarServico_(io) {
       gravar({ itens: base.itens, locais: locais, saldos: base.saldos, seq: base.seq, movimentos: base.movimentos }, []);
       return { ok: true };
     },
-    apiContagem: function (pedido) {
+    apiContagem: function (token, pedido) {
+      var usuario = sessao(token);
       var base = ler();
-      var r = aplicarContagem_(base, pedido || {}, io.usuario(), io.agora());
+      var r = aplicarContagem_(base, pedido || {}, usuario.email, io.agora());
       if (!r.movimentos.length) return { ajustes: 0, mensagem: 'Nenhuma diferença para lançar.' };
       gravar(r.base, r.movimentos);
       return { ajustes: r.movimentos.length, mensagem: r.movimentos.length + ' ajuste(s) de contagem lançado(s).' };
     },
-    apiImportarCsv: function (payload) {
+    apiImportarCsv: function (token, payload) {
+      var usuario = gestor(token);
       var base = ler();
       var texto = payload && payload.texto ? payload.texto : payload;
       var atualizar = !!(payload && payload.atualizarSaldos);
-      var r = importarLinhas_(base, texto, { atualizarSaldos: atualizar }, io.usuario(), io.agora());
+      var r = importarLinhas_(base, texto, { atualizarSaldos: atualizar }, usuario.email, io.agora());
       gravar(r.base, r.movimentos);
       return r.resumo;
     },
-    apiSugerirMinimos: function () {
+    apiSugerirMinimos: function (token) {
+      gestor(token);
       var base = ler();
       var r = sugerirMinimos_(base);
       gravar(r.base, []);
       return { atualizados: r.atualizados, mensagem: r.atualizados + ' ponto(s) de pedido sugerido(s).' };
+    },
+    apiListarUsuarios: function (token) {
+      gestor(token);
+      var lista = (ler().usuarios || []).map(publicoUsuario_).sort(function (a, b) {
+        if (a.perfil !== b.perfil) return a.perfil === 'GESTOR' ? -1 : 1;
+        return String(a.nome).localeCompare(String(b.nome));
+      });
+      return { usuarios: lista };
+    },
+    apiCriarUsuario: function (token, dados) {
+      gestor(token);
+      var base = ler();
+      var criado = criarUsuarioNaBase_(base, dados || {}, io.agora());
+      gravar(criado.base, []);
+      return { usuario: publicoUsuario_(criado.usuario) };
+    },
+    apiInativarUsuario: function (token, id) {
+      var eu = gestor(token);
+      var base = ler();
+      var usuarios = (base.usuarios || []).map(copiarUsuario_);
+      var alvo = acharUsuarioId_(usuarios, id);
+      if (!alvo) throw new Error('Acesso não encontrado.');
+      if (alvo.ativo === '1' && alvo.perfil === 'GESTOR' && gestoresAtivos_(usuarios).length <= 1) {
+        throw new Error('Precisa restar ao menos um gestor ativo.');
+      }
+      if (alvo.id === eu.id && gestoresAtivos_(usuarios).length <= 1) {
+        throw new Error('Precisa restar ao menos um gestor ativo.');
+      }
+      alvo.ativo = '0';
+      base.usuarios = usuarios;
+      base.sessoes = (base.sessoes || []).filter(function (s) { return s.usuarioId !== alvo.id; });
+      gravar(base, []);
+      return { ok: true };
+    },
+    apiReativarUsuario: function (token, id) {
+      gestor(token);
+      var base = ler();
+      var usuarios = (base.usuarios || []).map(copiarUsuario_);
+      var alvo = acharUsuarioId_(usuarios, id);
+      if (!alvo) throw new Error('Acesso não encontrado.');
+      alvo.ativo = '1';
+      base.usuarios = usuarios;
+      gravar(base, []);
+      return { ok: true };
     }
   };
 }
@@ -1094,7 +1547,7 @@ function obterPlanilha_() {
   try { ss.setSpreadsheetTimeZone('America/Sao_Paulo'); } catch (e2) {}
   var folhas = ss.getSheets();
   folhas[0].setName('Itens');
-  ['Locais', 'Saldos', 'Movimentos', 'Controle'].forEach(function (nome) {
+  ['Locais', 'Saldos', 'Movimentos', 'Controle', 'Usuarios', 'Sessoes'].forEach(function (nome) {
     ss.insertSheet(nome);
   });
   props.setProperty('PLANILHA_ID', ss.getId());
@@ -1182,7 +1635,27 @@ function lerBase_(ss) {
       if (n > seq) seq = n;
     });
   }
-  return { itens: itens, locais: locais, saldos: saldos, movimentos: movimentos, seq: seq };
+  var usuarios = lerRegistros_(aba_(ss, 'Usuarios'), CAMPOS_USUARIOS).map(copiarUsuario_).filter(function (u) {
+    return u.id && u.email;
+  });
+  var sessoes = lerRegistros_(aba_(ss, 'Sessoes'), CAMPOS_SESSOES).map(function (s) {
+    var expira = s.expiraEm;
+    if (Object.prototype.toString.call(expira) === '[object Date]' && !isNaN(expira.getTime())) expira = expira.getTime();
+    return {
+      token: String(s.token || ''),
+      usuarioId: String(s.usuarioId || ''),
+      expiraEm: Number(expira) || 0
+    };
+  }).filter(function (s) { return s.token && s.usuarioId; });
+  return {
+    itens: itens,
+    locais: locais,
+    saldos: saldos,
+    movimentos: movimentos,
+    seq: seq,
+    usuarios: usuarios,
+    sessoes: sessoes
+  };
 }
 
 function gravarMestre_(ss, base) {
@@ -1193,6 +1666,12 @@ function gravarMestre_(ss, base) {
     { chave: 'seq', valor: Number(base.seq) || 0 },
     { chave: 'app', valor: APP.nome + ' ' + APP.versao }
   ]);
+  if (base.usuarios) {
+    escreverRegistros_(aba_(ss, 'Usuarios'), CAMPOS_USUARIOS, base.usuarios.map(copiarUsuario_));
+  }
+  if (base.sessoes) {
+    escreverRegistros_(aba_(ss, 'Sessoes'), CAMPOS_SESSOES, base.sessoes);
+  }
 }
 
 function anexarMovimentos_(ss, movimentos) {
@@ -1271,18 +1750,27 @@ function googleServico_() {
   });
 }
 
-function apiContexto() { return comLock_(function () { return googleServico_().apiContexto(); }); }
-function apiPainel() { return comLock_(function () { return googleServico_().apiPainel(); }); }
-function apiEstoque() { return comLock_(function () { return googleServico_().apiEstoque(); }); }
-function apiHistorico() { return comLock_(function () { return googleServico_().apiHistorico(); }); }
-function apiMovimentar(pedido) { return comLock_(function () { return googleServico_().apiMovimentar(pedido); }); }
-function apiSalvarItem(item) { return comLock_(function () { return googleServico_().apiSalvarItem(item); }); }
-function apiSalvarLocal(local) { return comLock_(function () { return googleServico_().apiSalvarLocal(local); }); }
-function apiInativarLocal(id) { return comLock_(function () { return googleServico_().apiInativarLocal(id); }); }
-function apiReativarLocal(id) { return comLock_(function () { return googleServico_().apiReativarLocal(id); }); }
-function apiContagem(pedido) { return comLock_(function () { return googleServico_().apiContagem(pedido); }); }
-function apiImportarCsv(payload) { return comLock_(function () { return googleServico_().apiImportarCsv(payload); }); }
-function apiSugerirMinimos() { return comLock_(function () { return googleServico_().apiSugerirMinimos(); }); }
+function apiEstadoAcesso() { return comLock_(function () { return googleServico_().apiEstadoAcesso(); }); }
+function apiPrimeiroAcesso(dados) { return comLock_(function () { return googleServico_().apiPrimeiroAcesso(dados); }); }
+function apiLogin(email, senha) { return comLock_(function () { return googleServico_().apiLogin(email, senha); }); }
+function apiSair(token) { return comLock_(function () { return googleServico_().apiSair(token); }); }
+function apiContexto(token) { return comLock_(function () { return googleServico_().apiContexto(token); }); }
+function apiPainel(token) { return comLock_(function () { return googleServico_().apiPainel(token); }); }
+function apiRelatorio(token) { return comLock_(function () { return googleServico_().apiRelatorio(token); }); }
+function apiEstoque(token) { return comLock_(function () { return googleServico_().apiEstoque(token); }); }
+function apiHistorico(token) { return comLock_(function () { return googleServico_().apiHistorico(token); }); }
+function apiMovimentar(token, pedido) { return comLock_(function () { return googleServico_().apiMovimentar(token, pedido); }); }
+function apiSalvarItem(token, item) { return comLock_(function () { return googleServico_().apiSalvarItem(token, item); }); }
+function apiSalvarLocal(token, local) { return comLock_(function () { return googleServico_().apiSalvarLocal(token, local); }); }
+function apiInativarLocal(token, id) { return comLock_(function () { return googleServico_().apiInativarLocal(token, id); }); }
+function apiReativarLocal(token, id) { return comLock_(function () { return googleServico_().apiReativarLocal(token, id); }); }
+function apiContagem(token, pedido) { return comLock_(function () { return googleServico_().apiContagem(token, pedido); }); }
+function apiImportarCsv(token, payload) { return comLock_(function () { return googleServico_().apiImportarCsv(token, payload); }); }
+function apiSugerirMinimos(token) { return comLock_(function () { return googleServico_().apiSugerirMinimos(token); }); }
+function apiListarUsuarios(token) { return comLock_(function () { return googleServico_().apiListarUsuarios(token); }); }
+function apiCriarUsuario(token, dados) { return comLock_(function () { return googleServico_().apiCriarUsuario(token, dados); }); }
+function apiInativarUsuario(token, id) { return comLock_(function () { return googleServico_().apiInativarUsuario(token, id); }); }
+function apiReativarUsuario(token, id) { return comLock_(function () { return googleServico_().apiReativarUsuario(token, id); }); }
 
 
 /* ===================================================================== tela */
@@ -1357,8 +1845,9 @@ function cssApp_() {
     '.sino-badge { margin-left:auto; min-width:20px; height:20px; padding:0 6px; border-radius:99px; background:var(--vermelho); color:#fff; font-size:11px; font-weight:800; display:inline-flex; align-items:center; justify-content:center; }',
     '.principal { display:flex; flex-direction:column; overflow:hidden; min-width:0; }',
     '.topo { height:62px; flex-shrink:0; background:var(--superficie); border-bottom:1px solid var(--linha); display:flex; align-items:center; gap:14px; padding:0 22px; }',
-    '.topo-titulo { font-size:16px; font-weight:700; letter-spacing:-.35px; }',
-    '.topo-sub { font-size:11.5px; color:var(--tinta-3); }',
+    '.topo > div:first-child { min-width:0; }',
+    '.topo-titulo { font-size:16px; font-weight:700; letter-spacing:-.35px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }',
+    '.topo-sub { font-size:11.5px; color:var(--tinta-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }',
     '.topo-direita { margin-left:auto; display:flex; align-items:center; gap:9px; }',
     '.pilula { display:inline-flex; align-items:center; gap:6px; height:30px; padding:0 11px; border-radius:99px; font-size:12px; font-weight:600; border:1px solid var(--linha); background:var(--superficie-2); color:var(--tinta-2); white-space:nowrap; }',
     '.pilula.ok { background:var(--verde-suave); color:var(--verde); border-color:transparent; }',
@@ -1461,13 +1950,45 @@ function cssApp_() {
     '.casca { grid-template-columns:1fr; }',
     '.lateral { display:none; }',
     '.nav-topo { display:flex; }',
-    '}'
+    '.topo { padding:0 12px; gap:8px; }',
+    '.topo-direita .botao span { display:none; }',
+    '.pilula { display:none; }',
+    '}',
+    '.casca.oculta { display:none !important; }',
+    '.acesso { position:fixed; inset:0; z-index:40; display:flex; align-items:center; justify-content:center; padding:24px; overflow:auto; background:radial-gradient(900px 420px at 15% -10%, rgba(228,0,43,.16), transparent 55%), var(--bg); }',
+    '.acesso.oculta { display:none; }',
+    '.acesso-card { width:min(420px, 100%); background:var(--superficie); border:1px solid var(--linha); border-radius:var(--raio-g); box-shadow:var(--sombra-3); padding:28px 26px 22px; }',
+    '.acesso-card h1 { margin:12px 0 6px; font-size:22px; letter-spacing:-.4px; }',
+    '.acesso-card .botao { width:100%; justify-content:center; height:42px; margin-top:4px; }',
+    '.acesso-erro { min-height:1.2em; margin:10px 0 0; color:var(--vermelho); font-size:13px; font-weight:650; }',
+    '.campo[hidden] { display:none !important; }',
+    '.leitura { font-size:15px; line-height:1.55; margin:0 0 14px; color:var(--tinta); }',
+    '.medidor-box { display:flex; gap:16px; align-items:center; }',
+    '.legenda { display:flex; flex-wrap:wrap; gap:10px 14px; margin-top:8px; font-size:12px; color:var(--tinta-2); }',
+    '.legenda b { display:inline-block; width:9px; height:9px; border-radius:2px; margin-right:5px; }',
+    '.mix-barra { display:flex; height:12px; border-radius:99px; overflow:hidden; background:var(--superficie-3); margin:8px 0 12px; }',
+    '.mix-barra span { display:block; height:100%; }',
+    '.mix-barra .dur { background:var(--marca); }',
+    '.mix-barra .con { background:var(--azul); }'
   ].join('\n');
 }
 
 function cascaHtml_() {
   return [
-    '<div class="casca" id="casca">',
+    '<div class="acesso" id="acesso">',
+    '<form class="acesso-card" id="acesso-form" autocomplete="on">',
+    '<div class="marca-sigla" aria-hidden="true">EC</div>',
+    '<h1>Estoque de Campo</h1>',
+    '<p class="ajuda" id="acesso-sub">Entre com o e-mail e a senha cadastrados.</p>',
+    '<div class="campo" id="acesso-nome-campo" hidden><label for="acesso-nome">Nome</label><input id="acesso-nome" autocomplete="name"></div>',
+    '<div class="campo"><label for="acesso-email">E-mail</label><input id="acesso-email" type="email" autocomplete="username" required></div>',
+    '<div class="campo"><label for="acesso-senha">Senha</label><input id="acesso-senha" type="password" autocomplete="current-password" required></div>',
+    '<div class="campo" id="acesso-confirma-campo" hidden><label for="acesso-confirma">Confirmar senha</label><input id="acesso-confirma" type="password" autocomplete="new-password"></div>',
+    '<p class="ajuda" id="acesso-ajuda"></p>',
+    '<button class="botao primario" id="acesso-entrar" type="submit">Entrar</button>',
+    '<p class="acesso-erro" id="acesso-erro" role="alert"></p>',
+    '</form></div>',
+    '<div class="casca oculta" id="casca">',
     '<aside class="lateral">',
     '<div class="marca"><div class="marca-linha">',
     '<div class="marca-sigla" aria-hidden="true">EC</div>',
@@ -1480,7 +2001,7 @@ function cascaHtml_() {
     '<div class="avatar" id="usuario-iniciais">--</div>',
     '<div class="usuario-dados">',
     '<div class="usuario-nome" id="usuario-nome">Carregando</div>',
-    '<div class="usuario-papel">Operação de campo</div>',
+    '<div class="usuario-papel" id="usuario-papel">Operação de campo</div>',
     '</div></div>',
     '<nav id="nav"></nav>',
     '<div id="caixa-pendencias" class="caixa-pendencias"></div>',
@@ -1497,6 +2018,7 @@ function cascaHtml_() {
     '<span class="pilula" id="pilula-estado"><span class="ponto"></span><span id="pilula-texto">Conectando</span></span>',
     '<button class="botao" id="botao-tela" type="button" title="Tela cheia"></button>',
     '<button class="botao primario" id="botao-atualizar" type="button"></button>',
+    '<button class="botao" id="botao-sair" type="button" title="Sair"></button>',
     '</div></header>',
     '<div class="nav-topo" id="nav-topo"></div>',
     '<div class="area-conteudo"><div class="conteudo" id="conteudo">',
@@ -1514,9 +2036,11 @@ var CLIENTE_JS = [
 "/* Estoque de Campo — cliente embutido. Sem crase de proposito. */",
 "(function () {",
 "  'use strict';",
-"  var APP = { nome: 'Estoque de Campo', versao: '1.0.0' };",
+"  var APP = { nome: 'Estoque de Campo', versao: '1.1.0' };",
 "  var Estado = {",
 "    contexto: null,",
+"    token: '',",
+"    primeiro: false,",
 "    vista: ((window.PARAMETROS && PARAMETROS.view) || 'painel').toLowerCase(),",
 "    sidebarRecolhida: false,",
 "    pendencias: 0,",
@@ -1526,16 +2050,19 @@ var CLIENTE_JS = [
 "    itemForm: {},",
 "    contagemLocal: '',",
 "    historico: null,",
-"    histFiltro: ''",
+"    histFiltro: '',",
+"    usuarios: []",
 "  };",
+"  var SEM_TOKEN = { apiEstadoAcesso: 1, apiLogin: 1, apiPrimeiroAcesso: 1 };",
 "  var VISTAS = [",
-"    { id: 'painel', titulo: 'Painel', sub: 'Disponível no depósito, custódia e ponto de pedido', icone: 'monitor' },",
-"    { id: 'estoque', titulo: 'Posição', sub: 'Saldo por depósito e por técnico', icone: 'grade' },",
-"    { id: 'movimentar', titulo: 'Movimentar', sub: 'Entrada, saída, devolução, consumo, baixa e transferência', icone: 'seta' },",
-"    { id: 'tecnicos', titulo: 'Técnicos', sub: 'Quem carrega material e quais depósitos existem', icone: 'pessoa' },",
-"    { id: 'historico', titulo: 'Histórico', sub: 'Livro de movimentações', icone: 'lista' },",
-"    { id: 'contagem', titulo: 'Contagem', sub: 'Conferência física e ajuste do saldo', icone: 'check' },",
-"    { id: 'cadastro', titulo: 'Cadastro', sub: 'Itens, ponto de pedido e CSV', icone: 'engrenagem' }",
+"    { id: 'painel', titulo: 'Painel', sub: 'Nível de serviço, giro, cobertura e o que está parado', icone: 'monitor', grupo: 'gestao' },",
+"    { id: 'estoque', titulo: 'Posição', sub: 'Saldo por depósito e por técnico', icone: 'grade', grupo: 'op' },",
+"    { id: 'movimentar', titulo: 'Movimentar', sub: 'Entrada, saída, devolução, consumo, baixa e transferência', icone: 'seta', grupo: 'op' },",
+"    { id: 'tecnicos', titulo: 'Técnicos', sub: 'Quem carrega material e quais depósitos existem', icone: 'pessoa', grupo: 'gestao' },",
+"    { id: 'historico', titulo: 'Histórico', sub: 'Livro de movimentações', icone: 'lista', grupo: 'op' },",
+"    { id: 'contagem', titulo: 'Contagem', sub: 'Conferência física e ajuste do saldo', icone: 'check', grupo: 'op' },",
+"    { id: 'cadastro', titulo: 'Cadastro', sub: 'Itens, ponto de pedido e CSV', icone: 'engrenagem', grupo: 'gestao' },",
+"    { id: 'acessos', titulo: 'Acessos', sub: 'Quem entra como técnico e quem entra como gestor', icone: 'chave', grupo: 'gestao' }",
 "  ];",
 "  var ICONES = {",
 "    monitor: '<rect x=\"2\" y=\"3\" width=\"20\" height=\"14\" rx=\"2\"/><path d=\"M8 21h8M12 17v4\"/>',",
@@ -1548,7 +2075,9 @@ var CLIENTE_JS = [
 "    recarregar: '<path d=\"M21 12a9 9 0 1 1-2.6-6.4\"/><path d=\"M21 3v6h-6\"/>',",
 "    expandir: '<path d=\"M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3\"/>',",
 "    painelRecolher: '<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><path d=\"M9 3v18\"/><path d=\"M16 15l-3-3 3-3\"/>',",
-"    painelExpandir: '<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><path d=\"M9 3v18\"/><path d=\"M14 9l3 3-3 3\"/>'",
+"    painelExpandir: '<rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><path d=\"M9 3v18\"/><path d=\"M14 9l3 3-3 3\"/>',",
+"    chave: '<circle cx=\"8\" cy=\"15\" r=\"3.2\"/><path d=\"M10.5 13.2 20 4\"/><path d=\"M16 4h4v4\"/><path d=\"M15 9l2 2\"/>',",
+"    sair: '<path d=\"M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4\"/><path d=\"M16 17l5-5-5-5\"/><path d=\"M21 12H9\"/>'",
 "  };",
 "  var AJUDA_TIPO = {",
 "    ENTRADA: 'Recebimento no depósito. Entra no disponível. Se informar o custo, o custo médio do item é recalculado.',",
@@ -1590,25 +2119,142 @@ var CLIENTE_JS = [
 "    setTimeout(function () { if (t.parentNode) t.remove(); }, 4200);",
 "  }",
 "  function chamar(nome, args, ok, falha) {",
+"    var lista = (args || []).slice();",
+"    if (!SEM_TOKEN[nome]) lista.unshift(Estado.token || '');",
+"    function falhou(msg) {",
+"      if (ehSessao(msg) && nome !== 'apiLogin' && nome !== 'apiPrimeiroAcesso') {",
+"        limparSessao();",
+"        mostrarAcesso(false);",
+"        var erro = el('acesso-erro');",
+"        if (erro) erro.textContent = msg;",
+"        return;",
+"      }",
+"      falha(msg);",
+"    }",
 "    if (window.google && google.script && google.script.run) {",
 "      var runner = google.script.run.withSuccessHandler(ok).withFailureHandler(function (err) {",
-"        falha((err && err.message) ? err.message : 'Falha ao falar com a planilha.');",
+"        falhou((err && err.message) ? err.message : 'Falha ao falar com a planilha.');",
 "      });",
-"      runner[nome].apply(runner, args || []);",
+"      runner[nome].apply(runner, lista);",
 "      return;",
 "    }",
 "    fetch((window.PREVIEW_API || '/api/') + nome, {",
 "      method: 'POST',",
 "      headers: { 'Content-Type': 'application/json' },",
-"      body: JSON.stringify(args || [])",
+"      body: JSON.stringify(lista)",
 "    }).then(function (r) { return r.json(); }).then(function (body) {",
-"      if (!body || body.ok === false) falha((body && body.erro) || 'Falha');",
+"      if (!body || body.ok === false) falhou((body && body.erro) || 'Falha');",
 "      else ok(body.dados);",
-"    }).catch(function (e) { falha(e && e.message ? e.message : String(e)); });",
+"    }).catch(function (e) { falhou(e && e.message ? e.message : String(e)); });",
+"  }",
+"  function ehSessao(msg) {",
+"    var s = String(msg || '');",
+"    return s.indexOf('Sessão') >= 0 || s.indexOf('sessão') >= 0 || s.indexOf('Entre com') >= 0 || s.indexOf('Entre de novo') >= 0;",
+"  }",
+"  function perfilAtual() {",
+"    return (Estado.contexto && Estado.contexto.usuario && Estado.contexto.usuario.perfil) || '';",
+"  }",
+"  function ehGestor() { return perfilAtual() === 'GESTOR'; }",
+"  function vistasDoPerfil() {",
+"    if (!ehGestor()) {",
+"      return VISTAS.filter(function (v) {",
+"        return v.id === 'estoque' || v.id === 'movimentar' || v.id === 'contagem' || v.id === 'historico';",
+"      });",
+"    }",
+"    return VISTAS;",
+"  }",
+"  function aplicarVistaInicial() {",
+"    var lista = vistasDoPerfil();",
+"    var ok = false;",
+"    for (var i = 0; i < lista.length; i++) if (lista[i].id === Estado.vista) ok = true;",
+"    if (!ok) Estado.vista = lista[0].id;",
+"  }",
+"  function guardarSessao(dados) {",
+"    Estado.token = dados.token || '';",
+"    try { sessionStorage.setItem('estoque-campo.sessao', Estado.token); } catch (e) {}",
+"  }",
+"  function limparSessao() {",
+"    Estado.token = '';",
+"    Estado.contexto = null;",
+"    try { sessionStorage.removeItem('estoque-campo.sessao'); } catch (e) {}",
+"  }",
+"  function mostrarAcesso(primeiro) {",
+"    Estado.primeiro = !!primeiro;",
+"    var casca = el('casca');",
+"    var acesso = el('acesso');",
+"    if (casca) casca.classList.add('oculta');",
+"    if (acesso) acesso.classList.remove('oculta');",
+"    var nome = el('acesso-nome-campo');",
+"    var conf = el('acesso-confirma-campo');",
+"    if (nome) nome.hidden = !primeiro;",
+"    if (conf) conf.hidden = !primeiro;",
+"    var sub = el('acesso-sub');",
+"    if (sub) sub.textContent = primeiro",
+"      ? 'Primeiro acesso. Este e-mail e esta senha viram o gestor da operação.'",
+"      : 'Entre com o e-mail e a senha cadastrados.';",
+"    var ajuda = el('acesso-ajuda');",
+"    if (ajuda) ajuda.textContent = primeiro",
+"      ? 'A senha fica gravada de forma protegida na planilha. Os próximos acessos são criados pela gestão, como técnico ou gestor.'",
+"      : '';",
+"    var toastAntigo = document.querySelector('.toast');",
+"    if (toastAntigo) toastAntigo.remove();",
+"    var botao = el('acesso-entrar');",
+"    if (botao) botao.textContent = primeiro ? 'Criar acesso de gestor' : 'Entrar';",
+"    var senha = el('acesso-senha');",
+"    if (senha) senha.setAttribute('autocomplete', primeiro ? 'new-password' : 'current-password');",
+"  }",
+"  function entrarComToken() {",
+"    chamar('apiContexto', [], function (c) {",
+"      Estado.contexto = c;",
+"      Estado.form = { tipo: 'SAIDA' };",
+"      aplicarVistaInicial();",
+"      el('acesso').classList.add('oculta');",
+"      el('casca').classList.remove('oculta');",
+"      montarMoldura();",
+"      desenhar();",
+"    }, function (msg) {",
+"      limparSessao();",
+"      mostrarAcesso(false);",
+"      var erro = el('acesso-erro');",
+"      if (erro) erro.textContent = msg;",
+"    });",
+"  }",
+"  function enviarAcesso() {",
+"    var email = (el('acesso-email') && el('acesso-email').value || '').trim();",
+"    var senha = el('acesso-senha') ? el('acesso-senha').value : '';",
+"    var erro = el('acesso-erro');",
+"    var botao = el('acesso-entrar');",
+"    if (botao) botao.disabled = true;",
+"    function fim(msg) {",
+"      if (botao) botao.disabled = false;",
+"      if (erro) erro.textContent = msg || '';",
+"    }",
+"    if (Estado.primeiro) {",
+"      var nome = (el('acesso-nome') && el('acesso-nome').value || '').trim();",
+"      var confirma = el('acesso-confirma') ? el('acesso-confirma').value : '';",
+"      if (senha !== confirma) { fim('As senhas não conferem.'); return; }",
+"      chamar('apiPrimeiroAcesso', [{ nome: nome, email: email, senha: senha }], function (r) {",
+"        guardarSessao(r);",
+"        Estado.primeiro = false;",
+"        fim('');",
+"        entrarComToken();",
+"      }, fim);",
+"      return;",
+"    }",
+"    chamar('apiLogin', [email, senha], function (r) {",
+"      guardarSessao(r);",
+"      fim('');",
+"      entrarComToken();",
+"    }, fim);",
 "  }",
 "  function vistaAtual() {",
-"    for (var i = 0; i < VISTAS.length; i++) if (VISTAS[i].id === Estado.vista) return VISTAS[i];",
-"    return VISTAS[0];",
+"    var lista = vistasDoPerfil();",
+"    for (var i = 0; i < lista.length; i++) if (lista[i].id === Estado.vista) return lista[i];",
+"    return lista[0] || VISTAS[0];",
+"  }",
+"  function botaoNav(v) {",
+"    return '<button type=\"button\" class=\"nav-item' + (v.id === Estado.vista ? ' ativo' : '') + '\" data-vista=\"' + v.id + '\" title=\"' + esc(v.titulo) + '\">' +",
+"      icone(v.icone) + '<span>' + esc(v.titulo) + '</span></button>';",
 "  }",
 "  function montarMoldura() {",
 "    var c = Estado.contexto;",
@@ -1616,25 +2262,31 @@ var CLIENTE_JS = [
 "    el('usuario-nome').textContent = c.usuario.nome;",
 "    el('usuario-nome').title = c.usuario.email || '';",
 "    el('usuario-iniciais').textContent = c.usuario.iniciais;",
+"    var papel = el('usuario-papel');",
+"    if (papel) papel.textContent = c.usuario.perfil === 'GESTOR' ? 'Gestor' : 'Técnico';",
 "    el('rodape-versao').textContent = c.app.nome + ' v' + c.app.versao;",
-"    el('rodape-fonte').textContent = c.usuario.email || 'Perpétuo, com ponto de pedido';",
+"    el('rodape-fonte').textContent = c.usuario.email || '';",
 "    var link = el('rodape-planilha');",
 "    link.innerHTML = c.planilhaUrl ? '<a href=\"' + esc(c.planilhaUrl) + '\" target=\"_blank\" rel=\"noopener\">Abrir planilha</a>' : '';",
 "    document.title = c.app.nome;",
-"    var html = '<div class=\"nav-titulo\">Operação</div>' + VISTAS.map(function (v) {",
-"      return '<button type=\"button\" class=\"nav-item' + (v.id === Estado.vista ? ' ativo' : '') + '\" data-vista=\"' + v.id + '\" title=\"' + esc(v.titulo) + '\">' +",
-"        icone(v.icone) + '<span>' + esc(v.titulo) + '</span></button>';",
-"    }).join('');",
+"    var lista = vistasDoPerfil();",
+"    var html = '';",
+"    if (ehGestor()) {",
+"      var op = lista.filter(function (v) { return v.grupo !== 'gestao'; });",
+"      var ge = lista.filter(function (v) { return v.grupo === 'gestao'; });",
+"      html = '<div class=\"nav-titulo\">Operação</div>' + op.map(botaoNav).join('') +",
+"        '<div class=\"nav-titulo\">Gestão</div>' + ge.map(botaoNav).join('');",
+"    } else {",
+"      html = '<div class=\"nav-titulo\">Operação</div>' + lista.map(botaoNav).join('');",
+"    }",
 "    el('nav').innerHTML = html;",
-"    el('nav-topo').innerHTML = VISTAS.map(function (v) {",
-"      return '<button type=\"button\" class=\"nav-item' + (v.id === Estado.vista ? ' ativo' : '') + '\" data-vista=\"' + v.id + '\">' +",
-"        icone(v.icone) + '<span>' + esc(v.titulo) + '</span></button>';",
-"    }).join('');",
+"    el('nav-topo').innerHTML = lista.map(botaoNav).join('');",
 "    el('botao-atualizar').innerHTML = icone('recarregar') + '<span>Atualizar</span>';",
 "    el('botao-tela').innerHTML = icone('expandir');",
+"    el('botao-sair').innerHTML = icone('sair') + '<span>Sair</span>';",
 "    atualizarBotaoSidebar();",
 "    atualizarPendencias(c.abaixo || 0);",
-"    definirPilula('ok', 'Planilha ligada');",
+"    definirPilula('ok', 'Sessão ativa');",
 "  }",
 "  function atualizarBotaoSidebar() {",
 "    var botao = el('botao-sidebar');",
@@ -1659,7 +2311,8 @@ var CLIENTE_JS = [
 "  }",
 "  function irPara(id, extra) {",
 "    var achou = null;",
-"    for (var i = 0; i < VISTAS.length; i++) if (VISTAS[i].id === id) achou = VISTAS[i];",
+"    var lista = vistasDoPerfil();",
+"    for (var i = 0; i < lista.length; i++) if (lista[i].id === id) achou = lista[i];",
 "    if (!achou) return;",
 "    Estado.vista = id;",
 "    if (extra && extra.status) {",
@@ -1676,7 +2329,9 @@ var CLIENTE_JS = [
 "  function desenhar() {",
 "    var v = vistaAtual();",
 "    el('topo-titulo').textContent = v.titulo;",
-"    el('topo-sub').textContent = v.sub;",
+"    var sub = v.sub;",
+"    if (v.id === 'movimentar' && !ehGestor()) sub = 'Saída, devolução, consumo e transferência';",
+"    el('topo-sub').textContent = sub;",
 "    el('conteudo').innerHTML = '<div class=\"esqueleto\" style=\"height:140px\"></div>';",
 "    if (v.id === 'painel') carregarPainel();",
 "    else if (v.id === 'estoque') carregarEstoque(false);",
@@ -1685,9 +2340,10 @@ var CLIENTE_JS = [
 "    else if (v.id === 'historico') carregarHistorico();",
 "    else if (v.id === 'contagem') carregarEstoque(true);",
 "    else if (v.id === 'cadastro') carregarEstoque(true);",
+"    else if (v.id === 'acessos') carregarAcessos();",
 "  }",
 "  function carregarPainel() {",
-"    chamar('apiPainel', [], function (p) {",
+"    chamar(ehGestor() ? 'apiRelatorio' : 'apiPainel', [], function (p) {",
 "      atualizarPendencias(p.kpis.abaixo);",
 "      el('conteudo').innerHTML = desenharPainel(p);",
 "    }, falhaVista);",
@@ -1714,6 +2370,7 @@ var CLIENTE_JS = [
 "    }, falhaVista);",
 "  }",
 "  function falhaVista(msg) {",
+"    if (ehSessao(msg)) return;",
 "    definirPilula('erro', 'Falha');",
 "    el('conteudo').innerHTML = '<div class=\"aviso critico\">' + esc(msg) + '</div>';",
 "  }",
@@ -1729,9 +2386,122 @@ var CLIENTE_JS = [
 "    if (!c) return '';",
 "    return '<span class=\"selo abc-' + esc(c) + '\">' + esc(c) + '</span>';",
 "  }",
+"  function numTxt(v) {",
+"    if (v === null || v === undefined || v === '') return '—';",
+"    return String(v).replace('.', ',');",
+"  }",
+"  function desenharMedidor(pct) {",
+"    if (pct === null || pct === undefined) {",
+"      return '<div class=\"vazio-estado\" style=\"padding:12px\"><h3>Sem ponto de pedido</h3><p>Defina o ponto para medir quantos itens o depósito ainda cobre.</p></div>';",
+"    }",
+"    var p = Math.max(0, Math.min(100, Number(pct) || 0));",
+"    var arco = Math.PI * 54;",
+"    var cheio = arco * p / 100;",
+"    var cor = p >= 95 ? '#109E5C' : (p >= 80 ? '#DC9A06' : '#E4002B');",
+"    return '<svg viewBox=\"0 0 140 86\" width=\"168\" height=\"104\" role=\"img\" aria-label=\"Nível de serviço\">' +",
+"      '<path d=\"M16 70 A54 54 0 0 0 124 70\" fill=\"none\" stroke=\"#F1F2F6\" stroke-width=\"12\" stroke-linecap=\"round\"/>' +",
+"      '<path d=\"M16 70 A54 54 0 0 0 124 70\" fill=\"none\" stroke=\"' + cor + '\" stroke-width=\"12\" stroke-linecap=\"round\" stroke-dasharray=\"' + cheio.toFixed(1) + ' ' + arco.toFixed(1) + '\"/>' +",
+"      '<text x=\"70\" y=\"62\" text-anchor=\"middle\" font-size=\"22\" font-weight=\"700\" fill=\"#0D1220\">' + esc(numTxt(Math.round(p * 10) / 10)) + '%</text>' +",
+"      '<text x=\"70\" y=\"78\" text-anchor=\"middle\" font-size=\"10\" fill=\"#59627A\">nível de serviço</text></svg>';",
+"  }",
+"  function desenharSemanas(semanas) {",
+"    var lista = semanas || [];",
+"    var max = 1;",
+"    var tem = false;",
+"    lista.forEach(function (s) {",
+"      ['entrada', 'saida', 'consumo', 'baixa'].forEach(function (k) {",
+"        if ((s[k] || 0) > max) max = s[k];",
+"        if (s[k]) tem = true;",
+"      });",
+"    });",
+"    if (!tem) return '<p class=\"ajuda\">Ainda não há entrada, saída para campo, consumo ou baixa nestas oito semanas. A carga inicial não entra neste gráfico.</p>';",
+"    var w = 560;",
+"    var h = 148;",
+"    var pad = 8;",
+"    var grupo = (w - pad * 2) / Math.max(lista.length, 1);",
+"    var bw = Math.max(grupo / 5.2, 2);",
+"    var cores = { entrada: '#109E5C', saida: '#2563EB', consumo: '#DC9A06', baixa: '#E4002B' };",
+"    var svg = '<svg viewBox=\"0 0 ' + w + ' ' + (h + 22) + '\" width=\"100%\" height=\"170\" role=\"img\" aria-label=\"Movimento das últimas oito semanas\">';",
+"    lista.forEach(function (s, i) {",
+"      var x0 = pad + i * grupo;",
+"      ['entrada', 'saida', 'consumo', 'baixa'].forEach(function (k, j) {",
+"        var bh = ((s[k] || 0) / max) * (h - 10);",
+"        var x = x0 + j * bw;",
+"        var y = h - bh;",
+"        svg += '<rect x=\"' + x.toFixed(1) + '\" y=\"' + y.toFixed(1) + '\" width=\"' + Math.max(bw - 2, 1).toFixed(1) + '\" height=\"' + Math.max(bh, 0).toFixed(1) + '\" rx=\"2\" fill=\"' + cores[k] + '\"/>';",
+"      });",
+"      svg += '<text x=\"' + (x0 + grupo / 2).toFixed(1) + '\" y=\"' + (h + 14) + '\" text-anchor=\"middle\" font-size=\"10\" fill=\"#949CB0\">' + esc(s.rotulo) + '</text>';",
+"    });",
+"    svg += '</svg>';",
+"    svg += '<div class=\"legenda\"><span><b style=\"background:#109E5C\"></b>Entrada</span><span><b style=\"background:#2563EB\"></b>Saída para campo</span><span><b style=\"background:#DC9A06\"></b>Consumo</span><span><b style=\"background:#E4002B\"></b>Baixa</span></div>';",
+"    return svg;",
+"  }",
+"  function leituraGestao(g, k) {",
+"    var partes = [];",
+"    if (g.nivelServico === null || g.nivelServico === undefined) {",
+"      partes.push('Nenhum item tem ponto de pedido, então o nível de serviço do depósito ainda não fecha.');",
+"    } else {",
+"      partes.push('O depósito está acima do ponto em ' + numTxt(g.nivelServico) + '% dos ' + g.comPonto + ' itens que já têm ponto.');",
+"    }",
+"    if (!g.temUso) {",
+"      partes.push('Em 30 dias não houve consumo nem baixa: giro e cobertura ficam em aberto até existir uso real. Saída para o técnico não conta como uso, porque o material continua no patrimônio.');",
+"    } else {",
+"      partes.push('Consumo e baixa dos últimos 30 dias somam ' + moeda(g.uso30) + ', ritmo para cerca de ' + numTxt(g.coberturaDias) + ' dias de cobertura.');",
+"    }",
+"    if (g.perda30 > 0) partes.push('As baixas do período somam ' + moeda(g.perda30) + '.');",
+"    if (k.abaixo) partes.push(k.abaixo + ' item(ns) já chegaram no ponto de reposição.');",
+"    if (g.pareto && g.pareto.length) partes.push('Os oito itens de maior valor concentram ' + numTxt(g.pareto[g.pareto.length - 1].acum) + '% do estoque.');",
+"    return partes.join(' ');",
+"  }",
+"  function desenharGestao(p) {",
+"    var g = p.gestao;",
+"    var k = p.kpis;",
+"    var html = '<div class=\"secao-titulo\">Leitura da gestão</div>';",
+"    html += '<p class=\"leitura\">' + esc(leituraGestao(g, k)) + '</p>';",
+"    html += '<div class=\"grade-2\"><div class=\"cartao bloco\"><h3>Nível de serviço</h3><div class=\"sub\">Itens com ponto de pedido que ainda estão acima dele no depósito.</div>';",
+"    if (g.nivelServico === null || g.nivelServico === undefined) html += desenharMedidor(null);",
+"    else html += '<div class=\"medidor-box\">' + desenharMedidor(g.nivelServico) +",
+"      '<div><div class=\"kpi-valor num\">' + esc(numTxt(g.nivelServico)) + '%</div>' +",
+"      '<div class=\"kpi-apoio\">' + g.okPonto + ' de ' + g.comPonto + ' itens no ponto</div></div></div>';",
+"    html += '</div>';",
+"    html += '<div class=\"cartao bloco\"><h3>Uso em 30 dias</h3><div class=\"sub\">Consumo e baixa saem do patrimônio. Saída para campo continua sendo custódia.</div>';",
+"    html += '<div class=\"abc-linha\"><span>Giro</span><span class=\"num\">' + (g.giro === null || g.giro === undefined ? 'sem uso' : esc(numTxt(g.giro)) + '%') + '</span></div>';",
+"    html += '<div class=\"abc-linha\"><span>Cobertura</span><span class=\"num\">' + (g.coberturaDias === null || g.coberturaDias === undefined ? 'sem uso' : esc(numTxt(g.coberturaDias)) + ' dias') + '</span></div>';",
+"    html += '<div class=\"abc-linha\"><span>Perda (baixas)</span><span class=\"num\">' + moeda(g.perda30) + '</span></div>';",
+"    html += '<div class=\"abc-linha\"><span>Ajuste líquido de contagem</span><span class=\"num\">' + moeda(g.ajusteLiquido30) + '</span></div>';",
+"    html += '<div class=\"abc-linha\"><span>Saiu para o campo</span><span class=\"num\">' + moeda(g.saidaCampo30) + '</span></div>';",
+"    html += '</div></div>';",
+"    html += '<div class=\"grade-2\"><div class=\"cartao bloco\"><h3>Pareto do valor</h3><div class=\"sub\">Onde está o dinheiro. A porcentagem ao lado é o acumulado, do maior para o menor.</div>';",
+"    if (!g.pareto.length) html += '<p class=\"ajuda\">Sem valor em estoque.</p>';",
+"    else html += ranking(g.pareto.map(function (item) {",
+"      return { nome: item.sku + ' · ' + item.produto, valor: item.valor, rotulo: moeda(item.valor) + ' · ' + numTxt(item.acum) + '%' };",
+"    }));",
+"    html += '</div><div class=\"cartao bloco\"><h3>Oito semanas</h3><div class=\"sub\">Valor movimentado. A semana começa na data do rótulo.</div>' + desenharSemanas(g.semanas) + '</div></div>';",
+"    var mix = (g.duravel || 0) + (g.consumivel || 0);",
+"    var wDur = mix > 0 ? (g.duravel / mix) * 100 : 0;",
+"    var wCon = mix > 0 ? 100 - wDur : 0;",
+"    html += '<div class=\"grade-2\"><div class=\"cartao bloco\"><h3>Durável e consumível</h3><div class=\"sub\">Durável deve voltar. Consumível acaba na ordem de serviço.</div>';",
+"    html += '<div class=\"mix-barra\"><span class=\"dur\" style=\"width:' + wDur.toFixed(1) + '%\"></span><span class=\"con\" style=\"width:' + wCon.toFixed(1) + '%\"></span></div>';",
+"    html += '<div class=\"abc-linha\"><span>Durável</span><span class=\"num\">' + moeda(g.duravel) + '</span></div>';",
+"    html += '<div class=\"abc-linha\"><span>Consumível</span><span class=\"num\">' + moeda(g.consumivel) + '</span></div></div>';",
+"    html += '<div class=\"cartao bloco\"><h3>Estoque parado</h3><div class=\"sub\">Sem saída, consumo ou baixa nos últimos 45 dias. Os oito de maior valor.</div>';",
+"    if (!g.lentos.length) html += '<div class=\"aviso ok\">Todo item com saldo teve movimento operacional neste período.</div>';",
+"    else {",
+"      html += '<div class=\"tabela-wrap\"><table class=\"cadastro\"><thead><tr><th>SKU</th><th>Produto</th><th class=\"num\">Qtd</th><th class=\"num\">Valor</th><th></th></tr></thead><tbody>';",
+"      g.lentos.forEach(function (l) {",
+"        html += '<tr><td class=\"sku\">' + esc(l.sku) + '</td><td>' + esc(l.produto) + '</td><td class=\"num\">' + qtd(l.qtd) + ' ' + esc(l.unidade) + '</td><td class=\"num\">' + moeda(l.valor) + '</td><td>' + seloAbc(l.classeAbc) + '</td></tr>';",
+"      });",
+"      html += '</tbody></table></div>';",
+"    }",
+"    html += '</div></div>';",
+"    html += '<div class=\"secao-titulo\">Operação do dia</div>';",
+"    return html;",
+"  }",
 "  function desenharPainel(p) {",
 "    var k = p.kpis;",
-"    var html = '<div class=\"aviso info\">O ponto de pedido olha a soma dos depósitos. O que está com o técnico já saiu do disponível: durável fica em custódia e consumível vira estoque avançado até o consumo na OS.</div>';",
+"    var html = '';",
+"    if (p.gestao) html += desenharGestao(p);",
+"    html += '<div class=\"aviso info\">O ponto de pedido olha a soma dos depósitos. O que está com o técnico já saiu do disponível: durável fica em custódia e consumível vira estoque avançado até o consumo na OS.</div>';",
 "    html += '<div class=\"grade-kpi\">' +",
 "      kpi('No depósito', moeda(k.valorDeposito), k.skus + ' SKUs ativos', 'destaque') +",
 "      kpi('Com técnicos', moeda(k.valorTecnicos), 'Custódia e estoque avançado', '') +",
@@ -1872,19 +2642,31 @@ var CLIENTE_JS = [
 "    (item.locais || []).forEach(function (l) { if (l.id === localId) q = l.qtd; });",
 "    return q;",
 "  }",
+"  function tiposMovimento() {",
+"    var todos = [",
+"      ['ENTRADA', 'Entrada no depósito'],",
+"      ['SAIDA', 'Saída para técnico'],",
+"      ['DEVOLUCAO', 'Devolução do técnico'],",
+"      ['CONSUMO', 'Consumo em OS'],",
+"      ['BAIXA', 'Baixa (perda ou avaria)'],",
+"      ['TRANSFERENCIA', 'Transferência']",
+"    ];",
+"    if (ehGestor()) return todos;",
+"    return todos.filter(function (t) {",
+"      return t[0] === 'SAIDA' || t[0] === 'DEVOLUCAO' || t[0] === 'CONSUMO' || t[0] === 'TRANSFERENCIA';",
+"    });",
+"  }",
 "  function desenharMovimento() {",
 "    var f = Estado.form || { tipo: 'SAIDA' };",
+"    var permitidos = {};",
+"    tiposMovimento().forEach(function (t) { permitidos[t[0]] = 1; });",
+"    if (!permitidos[f.tipo]) { f.tipo = 'SAIDA'; Estado.form = f; }",
 "    var tipo = f.tipo || 'SAIDA';",
 "    var soCons = tipo === 'CONSUMO';",
 "    var html = '<div class=\"grade-cadastro\"><div class=\"cartao painel-form\"><h3>Novo lançamento</h3>' +",
 "      '<p class=\"ajuda\" id=\"ajuda-tipo\">' + esc(AJUDA_TIPO[tipo] || '') + '</p>' +",
 "      '<div class=\"campo\"><label>Tipo</label><select id=\"mov-tipo\">' +",
-"        optTipo('ENTRADA', 'Entrada no depósito', tipo) +",
-"        optTipo('SAIDA', 'Saída para técnico', tipo) +",
-"        optTipo('DEVOLUCAO', 'Devolução do técnico', tipo) +",
-"        optTipo('CONSUMO', 'Consumo em OS', tipo) +",
-"        optTipo('BAIXA', 'Baixa (perda ou avaria)', tipo) +",
-"        optTipo('TRANSFERENCIA', 'Transferência', tipo) +",
+"        tiposMovimento().map(function (t) { return optTipo(t[0], t[1], tipo); }).join('') +",
 "      '</select></div>';",
 "    html += '<div class=\"campo\"><label>Item</label><select id=\"mov-sku\">' + opcoesItens(f.sku || '', soCons) + '</select></div>';",
 "    html += '<div class=\"campo-linha\">';",
@@ -1916,13 +2698,15 @@ var CLIENTE_JS = [
 "    html += '<p class=\"ajuda\" id=\"mov-disponivel\">' + esc(textoDisponivel(f)) + '</p>';",
 "    html += '<div class=\"acoes-form\"><button type=\"button\" class=\"botao primario\" id=\"mov-gravar\" data-acao=\"gravar-mov\">Lançar</button></div></div>';",
 "    html += '<div class=\"cartao bloco\"><h3>Como o saldo se move</h3>' +",
-"      '<div class=\"abc-linha\"><span>Entrada</span><span>fornecedor → depósito</span></div>' +",
+"      (ehGestor() ? '<div class=\"abc-linha\"><span>Entrada</span><span>fornecedor → depósito</span></div>' : '') +",
 "      '<div class=\"abc-linha\"><span>Saída</span><span>depósito → técnico</span></div>' +",
 "      '<div class=\"abc-linha\"><span>Devolução</span><span>técnico → depósito</span></div>' +",
 "      '<div class=\"abc-linha\"><span>Consumo</span><span>sai do local, só consumível</span></div>' +",
-"      '<div class=\"abc-linha\"><span>Baixa</span><span>sai do local, com motivo</span></div>' +",
+"      (ehGestor() ? '<div class=\"abc-linha\"><span>Baixa</span><span>sai do local, com motivo</span></div>' : '') +",
 "      '<div class=\"abc-linha\"><span>Transferência</span><span>local → local</span></div>' +",
-"      '<p class=\"ajuda\" style=\"margin-top:12px\">O sistema recusa saldo negativo. Cada lançamento ganha um número e fica no histórico com quem operou.</p></div></div>';",
+"      '<p class=\"ajuda\" style=\"margin-top:12px\">' + (ehGestor()",
+"        ? 'O sistema recusa saldo negativo. Baixa e entrada ficam com a gestão. Cada lançamento ganha um número e fica no histórico com quem operou.'",
+"        : 'O sistema recusa saldo negativo. Baixa, entrada e exclusão de estoque ficam com a gestão. Cada lançamento ganha um número e fica no histórico com quem operou.') + '</p></div></div>';",
 "    return html;",
 "  }",
 "  function optTipo(id, rotulo, atual) {",
@@ -2067,6 +2851,9 @@ var CLIENTE_JS = [
 "    if (nome === 'limpar-item') { Estado.itemForm = {}; el('conteudo').innerHTML = desenharCadastro(); return; }",
 "    if (nome === 'editar-item') return editarItem(acao.getAttribute('data-sku'));",
 "    if (nome === 'sugerir-minimos') return sugerirMinimos();",
+"    if (nome === 'criar-acesso') return criarAcesso();",
+"    if (nome === 'inativar-acesso') return mudarAcesso(acao.getAttribute('data-id'), false);",
+"    if (nome === 'reativar-acesso') return mudarAcesso(acao.getAttribute('data-id'), true);",
 "  }",
 "  function gravarMov() {",
 "    var f = lerFormMov();",
@@ -2133,6 +2920,51 @@ var CLIENTE_JS = [
 "    el('conteudo').innerHTML = desenharCadastro();",
 "    var skuInput = el('item-sku');",
 "    if (skuInput) skuInput.focus();",
+"  }",
+"  function carregarAcessos() {",
+"    chamar('apiListarUsuarios', [], function (r) {",
+"      Estado.usuarios = (r && r.usuarios) || [];",
+"      el('conteudo').innerHTML = desenharAcessos();",
+"    }, falhaVista);",
+"  }",
+"  function desenharAcessos() {",
+"    var html = '<div class=\"grade-cadastro\"><div class=\"cartao painel-form\"><h3>Novo acesso</h3>' +",
+"      '<p class=\"ajuda\">Técnico lança saída, devolução, consumo, transferência e contagem. Gestor também lança entrada, baixa e mexe no cadastro.</p>' +",
+"      '<div class=\"campo\"><label>Nome</label><input id=\"acc-nome\" placeholder=\"Nome de quem vai entrar\"></div>' +",
+"      '<div class=\"campo\"><label>E-mail</label><input id=\"acc-email\" type=\"email\" placeholder=\"email@empresa.com\"></div>' +",
+"      '<div class=\"campo\"><label>Senha inicial</label><input id=\"acc-senha\" type=\"password\" autocomplete=\"new-password\" placeholder=\"Mínimo de 6 caracteres\"></div>' +",
+"      '<div class=\"campo\"><label>Perfil</label><select id=\"acc-perfil\"><option value=\"TECNICO\">Técnico</option><option value=\"GESTOR\">Gestor</option></select></div>' +",
+"      '<button type=\"button\" class=\"botao primario\" data-acao=\"criar-acesso\">Criar acesso</button></div>';",
+"    html += '<div class=\"cartao bloco\"><h3>Quem entra</h3><div class=\"tabela-wrap\"><table class=\"cadastro\"><thead><tr><th>Nome</th><th>E-mail</th><th>Perfil</th><th></th></tr></thead><tbody>';",
+"    (Estado.usuarios || []).forEach(function (u) {",
+"      html += '<tr class=\"' + (u.ativo === '1' ? '' : 'inativa') + '\"><td>' + esc(u.nome) + '</td><td>' + esc(u.email) + '</td><td>' +",
+"        (u.perfil === 'GESTOR' ? 'Gestor' : 'Técnico') + '</td><td>' +",
+"        (u.ativo === '1'",
+"          ? '<button type=\"button\" class=\"link\" data-acao=\"inativar-acesso\" data-id=\"' + esc(u.id) + '\">Inativar</button>'",
+"          : '<button type=\"button\" class=\"link\" data-acao=\"reativar-acesso\" data-id=\"' + esc(u.id) + '\">Reativar</button>') +",
+"        '</td></tr>';",
+"    });",
+"    html += '</tbody></table></div><p class=\"ajuda\" style=\"margin-top:12px\">A senha não volta para esta tela. Na planilha ela fica só como hash.</p></div></div>';",
+"    return html;",
+"  }",
+"  function criarAcesso() {",
+"    var pedido = {",
+"      nome: (el('acc-nome') && el('acc-nome').value || '').trim(),",
+"      email: (el('acc-email') && el('acc-email').value || '').trim(),",
+"      senha: el('acc-senha') ? el('acc-senha').value : '',",
+"      perfil: el('acc-perfil') ? el('acc-perfil').value : 'TECNICO'",
+"    };",
+"    chamar('apiCriarUsuario', [pedido], function () {",
+"      toast('Acesso criado.');",
+"      carregarAcessos();",
+"    }, function (msg) { toast(msg, true); });",
+"  }",
+"  function mudarAcesso(id, reativar) {",
+"    if (!reativar && !window.confirm('Inativar este acesso? A pessoa deixa de entrar até a gestão reativar.')) return;",
+"    chamar(reativar ? 'apiReativarUsuario' : 'apiInativarUsuario', [id], function () {",
+"      toast(reativar ? 'Acesso reativado.' : 'Acesso inativado.');",
+"      carregarAcessos();",
+"    }, function (msg) { toast(msg, true); });",
 "  }",
 "  function sugerirMinimos() {",
 "    if (!window.confirm('Definir ponto de pedido em 20% do saldo de depósito para itens que ainda estão sem ponto?')) return;",
@@ -2219,6 +3051,18 @@ var CLIENTE_JS = [
 "      atualizarBotaoSidebar();",
 "    });",
 "    el('botao-atualizar').addEventListener('click', function () { desenhar(); });",
+"    el('botao-sair').addEventListener('click', function () {",
+"      chamar('apiSair', [], function () {}, function () {});",
+"      limparSessao();",
+"      mostrarAcesso(false);",
+"      var erro = el('acesso-erro');",
+"      if (erro) erro.textContent = '';",
+"    });",
+"    var formAcesso = el('acesso-form');",
+"    if (formAcesso) formAcesso.addEventListener('submit', function (ev) {",
+"      ev.preventDefault();",
+"      enviarAcesso();",
+"    });",
 "    el('botao-tela').addEventListener('click', function () {",
 "      var alvo = document.documentElement;",
 "      if (!document.fullscreenElement && alvo.requestFullscreen) alvo.requestFullscreen();",
@@ -2296,20 +3140,22 @@ var CLIENTE_JS = [
 "      d.classList.remove('sobre');",
 "      if (ev.dataTransfer && ev.dataTransfer.files && ev.dataTransfer.files[0]) lerArquivo(ev.dataTransfer.files[0]);",
 "    });",
-"    chamar('apiContexto', [], function (c) {",
-"      Estado.contexto = c;",
-"      montarMoldura();",
-"      desenhar();",
+"    try { Estado.token = sessionStorage.getItem('estoque-campo.sessao') || ''; } catch (e2) {}",
+"    chamar('apiEstadoAcesso', [], function (est) {",
+"      if (est && est.precisaPrimeiroAcesso) {",
+"        limparSessao();",
+"        mostrarAcesso(true);",
+"        return;",
+"      }",
+"      if (!Estado.token) {",
+"        mostrarAcesso(false);",
+"        return;",
+"      }",
+"      entrarComToken();",
 "    }, function (msg) {",
-"      Estado.contexto = {",
-"        app: APP,",
-"        usuario: { nome: 'Operador', email: '', iniciais: 'OP' },",
-"        planilhaUrl: '',",
-"        abaixo: 0",
-"      };",
-"      montarMoldura();",
-"      definirPilula('erro', 'Sem planilha');",
-"      falhaVista(msg);",
+"      mostrarAcesso(false);",
+"      var erro = el('acesso-erro');",
+"      if (erro) erro.textContent = msg;",
 "    });",
 "  }",
 "  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', iniciar);",
@@ -2335,6 +3181,9 @@ if (typeof module !== 'undefined' && module.exports) {
     importarLinhas_: importarLinhas_,
     montarPosicao_: montarPosicao_,
     montarPainel_: montarPainel_,
+    montarRelatorio_: montarRelatorio_,
+    hashSenha_: hashSenha_,
+    criarUsuarioNaBase_: criarUsuarioNaBase_,
     sugerirMinimo_: sugerirMinimo_,
     paginaHtml_: paginaHtml_,
     htmlApp_: htmlApp_

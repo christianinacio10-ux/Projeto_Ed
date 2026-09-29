@@ -31,3 +31,27 @@ O ponto de pedido olha só a soma dos depósitos. O que está com o técnico já
 A curva ABC separa os itens pelo valor parado em estoque. Dá para sugerir ponto de pedido (20% do saldo do depósito, no mínimo 1) só nos itens que ainda não têm ponto.
 
 O CSV de origem pode ser importado de novo em Cadastro. Colunas usadas: SKU interno, produto, categoria, NCM, estoque atual, unidade, custo e depósito. Se marcar o lançamento de saldo, a diferença daquele depósito vira ajuste. O que está com o técnico não é apagado.
+
+## Acesso
+
+A primeira abertura pede nome, e-mail e senha. Esse acesso nasce como **gestor**. A senha não fica legível na planilha: a aba Usuarios guarda só o hash e o sal.
+
+| Perfil | O que faz |
+| --- | --- |
+| Técnico | Saída para técnico, devolução, consumo, transferência e contagem. Vê posição e histórico. |
+| Gestor | Tudo do técnico, mais entrada, baixa, cadastro, importação, ponto de pedido, locais e a leitura de gestão. Cria os outros acessos. |
+
+A sessão dura 12 horas neste navegador. Baixa, entrada e qualquer exclusão de estoque ficam só com a gestão. A contagem continua com o técnico, porque a diferença física é conferência, não descarte.
+
+## Leitura da gestão
+
+O painel do gestor calcula, a partir do livro:
+
+- nível de serviço: itens com ponto de pedido que ainda estão acima dele no depósito
+- giro e cobertura dos últimos 30 dias, só com consumo e baixa (saída para o campo continua sendo patrimônio)
+- perda do período e ajuste líquido de contagem
+- Pareto dos oito itens de maior valor
+- movimento semanal de entrada, saída, consumo e baixa
+- estoque parado: sem saída, consumo ou baixa em 45 dias
+
+Sem consumo real, giro e cobertura aparecem em aberto. O gráfico não inventa semana.
