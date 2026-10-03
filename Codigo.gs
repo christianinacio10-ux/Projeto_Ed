@@ -9,8 +9,7 @@
  *    (ou só o domínio, se a companhia usar Google Workspace).
  * 5. Autorize a planilha. A primeira abertura cria "Estoque de Campo" no Drive
  *    dessa conta. O primeiro acesso na tela grava o gestor (e-mail e senha).
- *    A senha fica só como hash na aba Usuarios. O link "Abrir planilha" no
- *    rodapé da gestão leva até ela.
+ *    A senha fica só como hash na aba Usuarios. A tela não mostra link da planilha.
  *
  * A tela (HTML + JavaScript) está embutida em paginaHtml_().
  * Não há logo. Depósitos do CSV de origem entram com nome de local, sem marca.
@@ -18,7 +17,7 @@
 
 var APP = {
   nome: 'Estoque de Campo',
-  versao: '1.1.0'
+  versao: '1.2.0'
 };
 
 var SEMENTE_LOCAIS = [
@@ -939,6 +938,34 @@ function aplicarContagem_(base, pedido, usuario, quando) {
   return { base: atual, movimentos: movimentos };
 }
 
+function aplicarTransferencias_(base, pedido, usuario, quando) {
+  if (!pedido || !pedido.origemId) throw new Error('Escolha a origem.');
+  if (!pedido.destinoId) throw new Error('Escolha o destino.');
+  if (pedido.origemId === pedido.destinoId) throw new Error('Origem e destino precisam ser diferentes.');
+  var atual = base;
+  var movimentos = [];
+  var uteis = 0;
+  (pedido.linhas || []).forEach(function (linha) {
+    if (!linha || linha.qtd === '' || linha.qtd === null || linha.qtd === undefined) return;
+    var qtd = arredQtd_(parseNumeroBr_(linha.qtd));
+    if (!(qtd > 0)) return;
+    uteis++;
+    var r = aplicarMovimento_(atual, {
+      tipo: 'TRANSFERENCIA',
+      sku: linha.sku,
+      qtd: qtd,
+      origemId: pedido.origemId,
+      destinoId: pedido.destinoId,
+      documento: pedido.documento || 'LOTE',
+      motivo: pedido.motivo || 'Transferência em lote'
+    }, usuario, quando);
+    atual = r.base;
+    if (r.movimento) movimentos.push(r.movimento);
+  });
+  if (!uteis) throw new Error('Informe a quantidade de ao menos um item.');
+  return { base: atual, movimentos: movimentos };
+}
+
 function baseInicial_() {
   var base = {
     itens: SEMENTE_ITENS.map(function (item) {
@@ -1323,7 +1350,7 @@ function criarServico_(io) {
     return {
       app: { nome: APP.nome, versao: APP.versao },
       usuario: publicoUsuario_(usuario),
-      planilhaUrl: usuario.perfil === 'GESTOR' ? (io.url() || '') : '',
+      planilhaUrl: '',
       abaixo: painel.kpis.abaixo
     };
   }
@@ -1444,6 +1471,13 @@ function criarServico_(io) {
       if (!r.movimentos.length) return { ajustes: 0, mensagem: 'Nenhuma diferença para lançar.' };
       gravar(r.base, r.movimentos);
       return { ajustes: r.movimentos.length, mensagem: r.movimentos.length + ' ajuste(s) de contagem lançado(s).' };
+    },
+    apiTransferirLote: function (token, pedido) {
+      var usuario = sessao(token);
+      var base = ler();
+      var r = aplicarTransferencias_(base, pedido || {}, usuario.email, io.agora());
+      gravar(r.base, r.movimentos);
+      return { transferencias: r.movimentos.length, mensagem: r.movimentos.length + ' transferência(s) lançada(s).' };
     },
     apiImportarCsv: function (token, payload) {
       var usuario = gestor(token);
@@ -1765,6 +1799,7 @@ function apiSalvarLocal(token, local) { return comLock_(function () { return goo
 function apiInativarLocal(token, id) { return comLock_(function () { return googleServico_().apiInativarLocal(token, id); }); }
 function apiReativarLocal(token, id) { return comLock_(function () { return googleServico_().apiReativarLocal(token, id); }); }
 function apiContagem(token, pedido) { return comLock_(function () { return googleServico_().apiContagem(token, pedido); }); }
+function apiTransferirLote(token, pedido) { return comLock_(function () { return googleServico_().apiTransferirLote(token, pedido); }); }
 function apiImportarCsv(token, payload) { return comLock_(function () { return googleServico_().apiImportarCsv(token, payload); }); }
 function apiSugerirMinimos(token) { return comLock_(function () { return googleServico_().apiSugerirMinimos(token); }); }
 function apiListarUsuarios(token) { return comLock_(function () { return googleServico_().apiListarUsuarios(token); }); }
@@ -2008,7 +2043,6 @@ function cascaHtml_() {
     '<div class="lateral-rodape">',
     '<div id="rodape-versao">&nbsp;</div>',
     '<div id="rodape-fonte">&nbsp;</div>',
-    '<div id="rodape-planilha"></div>',
     '</div></aside>',
     '<main class="principal">',
     '<header class="topo"><div>',
@@ -2036,7 +2070,7 @@ var CLIENTE_JS = [
 "/* Estoque de Campo — cliente embutido. Sem crase de proposito. */",
 "(function () {",
 "  'use strict';",
-"  var APP = { nome: 'Estoque de Campo', versao: '1.1.0' };",
+"  var APP = { nome: 'Estoque de Campo', versao: '1.2.0' };",
 "  var Estado = {",
 "    contexto: null,",
 "    token: '',",
@@ -2049,6 +2083,7 @@ var CLIENTE_JS = [
 "    form: { tipo: 'SAIDA' },",
 "    itemForm: {},",
 "    contagemLocal: '',",
+"    lote: { origemId: '', destinoId: '', documento: '', busca: '', qtds: {} },",
 "    historico: null,",
 "    histFiltro: '',",
 "    usuarios: []",
@@ -2058,6 +2093,7 @@ var CLIENTE_JS = [
 "    { id: 'painel', titulo: 'Painel', sub: 'Nível de serviço, giro, cobertura e o que está parado', icone: 'monitor', grupo: 'gestao' },",
 "    { id: 'estoque', titulo: 'Posição', sub: 'Saldo por depósito e por técnico', icone: 'grade', grupo: 'op' },",
 "    { id: 'movimentar', titulo: 'Movimentar', sub: 'Entrada, saída, devolução, consumo, baixa e transferência', icone: 'seta', grupo: 'op' },",
+"    { id: 'lote', titulo: 'Lote', sub: 'Várias transferências, da mesma origem para o mesmo destino', icone: 'lote', grupo: 'op' },",
 "    { id: 'tecnicos', titulo: 'Técnicos', sub: 'Quem carrega material e quais depósitos existem', icone: 'pessoa', grupo: 'gestao' },",
 "    { id: 'historico', titulo: 'Histórico', sub: 'Livro de movimentações', icone: 'lista', grupo: 'op' },",
 "    { id: 'contagem', titulo: 'Contagem', sub: 'Conferência física e ajuste do saldo', icone: 'check', grupo: 'op' },",
@@ -2068,6 +2104,7 @@ var CLIENTE_JS = [
 "    monitor: '<rect x=\"2\" y=\"3\" width=\"20\" height=\"14\" rx=\"2\"/><path d=\"M8 21h8M12 17v4\"/>',",
 "    grade: '<rect x=\"3\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"3\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"3\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/><rect x=\"14\" y=\"14\" width=\"7\" height=\"7\" rx=\"1.5\"/>',",
 "    seta: '<path d=\"M5 12h14\"/><path d=\"M13 6l6 6-6 6\"/>',",
+"    lote: '<path d=\"M4 7h16\"/><path d=\"M4 12h16\"/><path d=\"M4 17h10\"/><path d=\"M17 15l3 2-3 2\"/>',",
 "    pessoa: '<path d=\"M20 21a8 8 0 0 0-16 0\"/><circle cx=\"12\" cy=\"8\" r=\"3.2\"/>',",
 "    lista: '<path d=\"M8 6h13M8 12h13M8 18h13\"/><path d=\"M3 6h.01M3 12h.01M3 18h.01\"/>',",
 "    check: '<path d=\"M9 11l3 3L22 4\"/><path d=\"M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11\"/>',",
@@ -2158,7 +2195,7 @@ var CLIENTE_JS = [
 "  function vistasDoPerfil() {",
 "    if (!ehGestor()) {",
 "      return VISTAS.filter(function (v) {",
-"        return v.id === 'estoque' || v.id === 'movimentar' || v.id === 'contagem' || v.id === 'historico';",
+"        return v.id === 'estoque' || v.id === 'movimentar' || v.id === 'lote' || v.id === 'contagem' || v.id === 'historico';",
 "      });",
 "    }",
 "    return VISTAS;",
@@ -2266,8 +2303,6 @@ var CLIENTE_JS = [
 "    if (papel) papel.textContent = c.usuario.perfil === 'GESTOR' ? 'Gestor' : 'Técnico';",
 "    el('rodape-versao').textContent = c.app.nome + ' v' + c.app.versao;",
 "    el('rodape-fonte').textContent = c.usuario.email || '';",
-"    var link = el('rodape-planilha');",
-"    link.innerHTML = c.planilhaUrl ? '<a href=\"' + esc(c.planilhaUrl) + '\" target=\"_blank\" rel=\"noopener\">Abrir planilha</a>' : '';",
 "    document.title = c.app.nome;",
 "    var lista = vistasDoPerfil();",
 "    var html = '';",
@@ -2336,6 +2371,7 @@ var CLIENTE_JS = [
 "    if (v.id === 'painel') carregarPainel();",
 "    else if (v.id === 'estoque') carregarEstoque(false);",
 "    else if (v.id === 'movimentar') carregarEstoque(true);",
+"    else if (v.id === 'lote') carregarEstoque(true);",
 "    else if (v.id === 'tecnicos') carregarEstoque(true);",
 "    else if (v.id === 'historico') carregarHistorico();",
 "    else if (v.id === 'contagem') carregarEstoque(true);",
@@ -2357,6 +2393,7 @@ var CLIENTE_JS = [
 "      var id = Estado.vista;",
 "      if (id === 'estoque') el('conteudo').innerHTML = desenharEstoque();",
 "      else if (id === 'movimentar') el('conteudo').innerHTML = desenharMovimento();",
+"      else if (id === 'lote') el('conteudo').innerHTML = desenharLote();",
 "      else if (id === 'tecnicos') el('conteudo').innerHTML = desenharTecnicos();",
 "      else if (id === 'contagem') el('conteudo').innerHTML = desenharContagem();",
 "      else if (id === 'cadastro') el('conteudo').innerHTML = desenharCadastro();",
@@ -2804,6 +2841,107 @@ var CLIENTE_JS = [
 "      '<button type=\"button\" class=\"botao\" data-acao=\"exportar-hist\">Exportar CSV</button></div>' +",
 "      '<div class=\"cartao bloco\" id=\"hist-tabela\">' + tabelaMovimentos(listaHistorico()) + '</div>';",
 "  }",
+"  function garantirLote() {",
+"    if (!Estado.lote) Estado.lote = { origemId: '', destinoId: '', documento: '', busca: '', qtds: {} };",
+"    if (!Estado.lote.qtds) Estado.lote.qtds = {};",
+"    return Estado.lote;",
+"  }",
+"  function itensDoLote() {",
+"    var lote = garantirLote();",
+"    var busca = semAcentoCli(lote.busca);",
+"    return (Estado.posicao.linhas || []).filter(function (l) {",
+"      if (l.ativo !== '1') return false;",
+"      if (!(saldoNoLocal(l.sku, lote.origemId) > 0)) return false;",
+"      if (!busca) return true;",
+"      return semAcentoCli(l.sku + ' ' + l.produto).indexOf(busca) >= 0;",
+"    });",
+"  }",
+"  function opcoesDestinoLote(origemId, selecionado) {",
+"    var html = '<option value=\"\">Destino</option>';",
+"    (Estado.posicao.locais || []).forEach(function (l) {",
+"      if (l.ativo !== '1' || l.id === origemId) return;",
+"      html += '<option value=\"' + esc(l.id) + '\"' + (l.id === selecionado ? ' selected' : '') + '>' + esc(l.nome) + '</option>';",
+"    });",
+"    return html;",
+"  }",
+"  function tabelaLote() {",
+"    var lote = garantirLote();",
+"    var linhas = itensDoLote();",
+"    if (!linhas.length) return '<div class=\"vazio-estado\"><h3>Nada para transferir</h3><p>Esse lugar não tem saldo com essa busca.</p></div>';",
+"    var html = '<div class=\"tabela-wrap\"><table class=\"cadastro\"><thead><tr><th>SKU</th><th>Produto</th><th class=\"num\">Disponível</th><th class=\"num\">Transferir</th></tr></thead><tbody>';",
+"    linhas.forEach(function (l) {",
+"      var livro = saldoNoLocal(l.sku, lote.origemId);",
+"      var valor = lote.qtds[l.sku] || '';",
+"      html += '<tr><td class=\"sku\">' + esc(l.sku) + '</td><td>' + esc(l.produto) + '</td>' +",
+"        '<td class=\"num\">' + qtd(livro) + ' ' + esc(l.unidade) + '</td>' +",
+"        '<td class=\"num\"><input class=\"lote-qtd\" data-sku=\"' + esc(l.sku) + '\" inputmode=\"decimal\" value=\"' + esc(valor) + '\" placeholder=\"\" style=\"width:110px;height:34px;border:1px solid var(--linha);border-radius:8px;padding:0 8px;text-align:right;font:inherit\"></td></tr>';",
+"    });",
+"    return html + '</tbody></table></div>';",
+"  }",
+"  function desenharLote() {",
+"    var lote = garantirLote();",
+"    var html = '<div class=\"aviso info\">Cada quantidade vira uma transferência da origem para o destino. Em branco fica de fora. Transferir o saldo inteiro preenche tudo o que está na origem.</div>';",
+"    html += '<div class=\"barra-filtro\">' +",
+"      '<div class=\"campo\"><label>Origem</label><select id=\"lote-origem\">' + opcoesLocais('', lote.origemId, 'De onde sai') + '</select></div>' +",
+"      '<div class=\"campo\"><label>Destino</label><select id=\"lote-destino\">' + opcoesDestinoLote(lote.origemId, lote.destinoId) + '</select></div>' +",
+"      '<div class=\"campo\"><label>Documento</label><input id=\"lote-doc\" value=\"' + esc(lote.documento) + '\" placeholder=\"OS ou documento\"></div>' +",
+"      '<button type=\"button\" class=\"botao\" data-acao=\"copiar-lote\">Transferir o saldo inteiro</button>' +",
+"      '<button type=\"button\" class=\"botao\" data-acao=\"limpar-lote\">Limpar</button>' +",
+"      '<button type=\"button\" class=\"botao primario\" data-acao=\"lancar-lote\">Lançar lote</button></div>';",
+"    if (!lote.origemId) return html + '<div class=\"cartao vazio-estado\"><h3>Escolha a origem</h3><p>Depósito ou técnico. A lista mostra só o que está nesse lugar.</p></div>';",
+"    html += '<div class=\"barra-filtro\"><div class=\"campo\"><label>Busca</label><input id=\"lote-busca\" value=\"' + esc(lote.busca) + '\" placeholder=\"SKU ou produto\"></div></div>';",
+"    html += '<div class=\"cartao\" id=\"lote-tabela\">' + tabelaLote() + '</div>';",
+"    return html;",
+"  }",
+"  function lerQtdsLote() {",
+"    var lote = garantirLote();",
+"    Array.prototype.forEach.call(document.querySelectorAll('.lote-qtd'), function (input) {",
+"      lote.qtds[input.getAttribute('data-sku')] = input.value;",
+"    });",
+"  }",
+"  function copiarLote() {",
+"    var lote = garantirLote();",
+"    if (!lote.origemId) { toast('Escolha a origem.', true); return; }",
+"    (Estado.posicao.linhas || []).forEach(function (l) {",
+"      if (l.ativo !== '1') return;",
+"      var livro = saldoNoLocal(l.sku, lote.origemId);",
+"      if (livro > 0) lote.qtds[l.sku] = String(livro).replace('.', ',');",
+"    });",
+"    el('conteudo').innerHTML = desenharLote();",
+"  }",
+"  function limparLote() {",
+"    garantirLote().qtds = {};",
+"    el('conteudo').innerHTML = desenharLote();",
+"  }",
+"  function lancarLote() {",
+"    var lote = garantirLote();",
+"    lerQtdsLote();",
+"    if (!lote.origemId || !lote.destinoId) { toast('Escolha origem e destino.', true); return; }",
+"    if (lote.origemId === lote.destinoId) { toast('Origem e destino precisam ser diferentes.', true); return; }",
+"    var linhas = [];",
+"    var skus = Object.keys(lote.qtds);",
+"    for (var i = 0; i < skus.length; i++) {",
+"      var s = String(lote.qtds[skus[i]] || '').trim();",
+"      if (!s) continue;",
+"      linhas.push({ sku: skus[i], qtd: s.replace(/\\./g, '').replace(',', '.') });",
+"    }",
+"    if (!linhas.length) { toast('Informe a quantidade de ao menos um item.', true); return; }",
+"    var botao = document.querySelector('[data-acao=\"lancar-lote\"]');",
+"    if (botao) botao.disabled = true;",
+"    chamar('apiTransferirLote', [{",
+"      origemId: lote.origemId,",
+"      destinoId: lote.destinoId,",
+"      documento: (el('lote-doc') && el('lote-doc').value) || lote.documento || 'LOTE',",
+"      linhas: linhas",
+"    }], function (r) {",
+"      toast(r.mensagem || 'Lote lançado.');",
+"      lote.qtds = {};",
+"      carregarEstoque(true);",
+"    }, function (msg) {",
+"      if (botao) botao.disabled = false;",
+"      toast(msg, true);",
+"    });",
+"  }",
 "  function desenharContagem() {",
 "    var localId = Estado.contagemLocal || '';",
 "    var html = '<div class=\"aviso info\">Informe a quantidade física só nas linhas contadas. Em branco não altera o livro. A diferença vira ajuste, com documento.</div>';",
@@ -2872,6 +3010,9 @@ var CLIENTE_JS = [
 "    if (nome === 'exportar-hist') return exportarHist();",
 "    if (nome === 'copiar-livro') return copiarLivro();",
 "    if (nome === 'lancar-contagem') return lancarContagem();",
+"    if (nome === 'copiar-lote') return copiarLote();",
+"    if (nome === 'limpar-lote') return limparLote();",
+"    if (nome === 'lancar-lote') return lancarLote();",
 "    if (nome === 'salvar-item') return salvarItem();",
 "    if (nome === 'limpar-item') { Estado.itemForm = {}; el('conteudo').innerHTML = desenharCadastro(); return; }",
 "    if (nome === 'editar-item') return editarItem(acao.getAttribute('data-sku'));",
@@ -3134,6 +3275,15 @@ var CLIENTE_JS = [
 "        Estado.contagemLocal = t.value;",
 "        el('conteudo').innerHTML = desenharContagem();",
 "      }",
+"      if (t.id === 'lote-origem' || t.id === 'lote-destino') {",
+"        var lote = garantirLote();",
+"        var origemAntes = lote.origemId;",
+"        lote.origemId = el('lote-origem') ? el('lote-origem').value : '';",
+"        lote.destinoId = el('lote-destino') ? el('lote-destino').value : '';",
+"        if (lote.origemId !== origemAntes) lote.qtds = {};",
+"        if (lote.destinoId && lote.destinoId === lote.origemId) lote.destinoId = '';",
+"        el('conteudo').innerHTML = desenharLote();",
+"      }",
 "      if (t.id === 'arquivo-csv' && t.files && t.files[0]) lerArquivo(t.files[0]);",
 "    });",
 "    document.body.addEventListener('input', function (ev) {",
@@ -3157,6 +3307,18 @@ var CLIENTE_JS = [
 "        Estado.histFiltro = t.value;",
 "        var caixa = el('hist-tabela');",
 "        if (caixa) caixa.innerHTML = tabelaMovimentos(listaHistorico());",
+"      }",
+"      if (t.id === 'lote-busca') {",
+"        lerQtdsLote();",
+"        garantirLote().busca = t.value;",
+"        var caixaLote = el('lote-tabela');",
+"        if (caixaLote) caixaLote.innerHTML = tabelaLote();",
+"        var buscaLote = el('lote-busca');",
+"        if (buscaLote) { var posLote = buscaLote.value.length; buscaLote.focus(); buscaLote.setSelectionRange(posLote, posLote); }",
+"      }",
+"      if (t.id === 'lote-doc') garantirLote().documento = t.value;",
+"      if (t.classList && t.classList.contains('lote-qtd')) {",
+"        garantirLote().qtds[t.getAttribute('data-sku')] = t.value;",
 "      }",
 "    });",
 "    document.body.addEventListener('dragover', function (ev) {",

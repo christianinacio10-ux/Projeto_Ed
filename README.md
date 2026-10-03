@@ -8,7 +8,7 @@ Controle do estoque que fica no depósito e do que está em poder dos técnicos.
 2. Apague o conteúdo de `Código.gs` e cole o arquivo `Codigo.gs` inteiro.
 3. **Implantar → Nova implantação → Aplicativo da Web**.
 4. Executar como **Eu**. Acesso: qualquer conta Google, ou só o domínio da companhia.
-5. Autorize a planilha. Na primeira abertura o script cria a planilha **Estoque de Campo** no Drive dessa conta. O link **Abrir planilha** fica no rodapé.
+5. Autorize a planilha. Na primeira abertura o script cria a planilha **Estoque de Campo** no Drive dessa conta. A tela não mostra o link dela.
 
 A carga inicial já entra com os 48 itens do arquivo de setembro de 2026. Depósitos: Campinas — Ferramentas, Campinas — Equipamentos e Mococa. Nenhum técnico vem cadastrado.
 
@@ -24,6 +24,7 @@ O saldo é perpétuo: cada lançamento atualiza na hora e ganha um número (`MOV
 | Consumo | Baixa consumível usado em OS. Durável não passa por aqui. |
 | Baixa | Perda, avaria ou extravio, com motivo. |
 | Transferência | De um local para outro, sem consumir. |
+| Lote | Várias transferências de uma origem para um destino, de uma vez. Dá para copiar o saldo inteiro da origem. |
 | Contagem | A diferença entre o físico e o livro vira ajuste. |
 
 O ponto de pedido olha só a soma dos depósitos. O que está com o técnico já saiu do disponível: durável é custódia e consumível é estoque avançado. Quando o depósito chega no ponto, a quantidade sugerida repõe até duas vezes esse ponto.
